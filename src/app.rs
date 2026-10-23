@@ -119,8 +119,8 @@ pub struct StudioApp {
     pub bottom: BottomTab,
     pub lane_rects: Vec<(Id, egui::Rect)>,
     pub snippet_rects: Vec<(Id, egui::Rect)>,
-    /// Open plugin GUI windows.
-    pub plugin_windows: Vec<crate::lv2ui::PluginWindow>,
+    /// Plugin GUI windows (run on their own thread).
+    pub gui: crate::lv2ui::GuiHost,
     pub export: ExportUi,
     pub audio_ports: Vec<String>,
     /// Playback devices (client name, ports) for the master output.
@@ -167,7 +167,7 @@ impl StudioApp {
             bottom: BottomTab::Takes,
             lane_rects: vec![],
             snippet_rects: vec![],
-            plugin_windows: vec![],
+            gui: crate::lv2ui::GuiHost::new(),
             export: ExportUi::default(),
             audio_ports: vec![],
             output_devices: vec![],
@@ -374,16 +374,14 @@ impl StudioApp {
         let Some(t) = self.project.track(track) else { return };
         let Some(slot) = t.devices.get(index) else { return };
         let (Some(link), Some(shared)) = (slot.lv2.clone(), slot.shared.clone()) else { return };
-        if self.plugin_windows.iter().any(|w| Arc::ptr_eq(&w.shared, &shared)) {
+        if self.gui.is_open(&shared) {
             self.notify(format!("{} GUI is already open", slot.name));
             return;
         }
         // XStoreName takes Latin-1, so keep the title ASCII-safe.
         let title = format!("{} - {}", slot.name, t.name);
-        match crate::lv2ui::PluginWindow::open(link, shared, title, self.rate() as f32) {
-            Ok(w) => self.plugin_windows.push(w),
-            Err(e) => self.notify(format!("Cannot open {} GUI: {e}", slot.name)),
-        }
+        let rate = self.rate() as f32;
+        self.gui.open(link, shared, title, rate);
     }
 
     /// Close the GUIs of a track's devices (all of them, or only `index`).
@@ -397,7 +395,9 @@ impl StudioApp {
             .filter(|(i, _)| index.is_none_or(|x| x == *i))
             .filter_map(|(_, d)| d.shared.clone())
             .collect();
-        self.plugin_windows.retain(|w| !doomed.iter().any(|s| Arc::ptr_eq(s, &w.shared)));
+        for s in doomed {
+            self.gui.close(&s);
+        }
     }
 
     fn remove_device(&mut self, track: Id, index: usize) {
@@ -845,7 +845,7 @@ impl StudioApp {
         if self.recording() || self.playing() {
             self.engine.send(Command::Stop);
         }
-        self.plugin_windows.clear();
+        self.gui.close_all();
         for t in &self.project.tracks {
             self.engine.send(Command::RemoveTrack(t.id));
         }
@@ -1477,7 +1477,7 @@ impl StudioApp {
             ui.centered_and_justified(|ui| ui.label(RichText::new("Select a track to see its device chain").color(TEXT_DIM)));
             return;
         };
-        let open_guis: Vec<Arc<DeviceShared>> = self.plugin_windows.iter().map(|w| w.shared.clone()).collect();
+        let gui = &self.gui;
         let Some(track) = self.project.track(tid) else { return };
         let kind = track.kind;
         let mut action: Option<(usize, i32)> = None; // (index, -1 left / +1 right / 0 remove)
@@ -1516,7 +1516,7 @@ impl StudioApp {
                         ui.separator();
                         let Some(info) = info else { return };
                         if info.has_gui {
-                            let open = open_guis.iter().any(|s| Arc::ptr_eq(s, shared));
+                            let open = gui.is_open(shared);
                             let label = if open { format!("{} GUI open", icon::APP_WINDOW) } else { format!("{} Open GUI", icon::APP_WINDOW) };
                             let b = egui::Button::new(RichText::new(label).color(if open { ACCENT } else { theme::TEXT })).min_size(egui::vec2(234.0, 26.0));
                             if ui.add_enabled(!open, b).on_hover_text("Open the plugin's own interface in a separate window").clicked() {
@@ -1763,8 +1763,9 @@ impl eframe::App for StudioApp {
         self.last_frame = now;
 
         self.engine.collect_garbage();
-        // Drive plugin GUIs (events, idle, value updates); drop closed ones.
-        self.plugin_windows.retain_mut(|w| w.pump());
+        for msg in self.gui.poll() {
+            self.notify(msg);
+        }
         self.poll_recording();
         self.sync_shared(dt);
         if self.ports_refreshed.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) {
@@ -1827,12 +1828,12 @@ impl eframe::App for StudioApp {
         }
         // Meters and the playhead need continuous updates.
         // Meters, the playhead and plugin GUIs need continuous updates.
-        let busy = self.playing() || !self.plugin_windows.is_empty();
+        let busy = self.playing() || self.gui.has_pending();
         ctx.request_repaint_after(Duration::from_millis(if busy { 16 } else { 40 }));
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.plugin_windows.clear();
+        self.gui.close_all();
         // Finish recordings so WAV headers get written.
         if self.recording() {
             self.engine.send(Command::Stop);

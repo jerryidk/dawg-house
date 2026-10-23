@@ -246,7 +246,7 @@ fn snippet_columns_place_record_and_edit() {
 #[test]
 #[ignore]
 fn tone3000_gui_from_app_and_state_roundtrip() {
-    crate::lv2ui::init_x11_threads();
+    crate::lv2ui::init_x11();
     let mut h = harness();
     let track = h.state().project.tracks[0].id;
     h.state_mut().add_device(track, "lv2:https://www.tone3000.com/plugin");
@@ -254,14 +254,21 @@ fn tone3000_gui_from_app_and_state_roundtrip() {
     h.state_mut().bottom = BottomTab::Devices;
     h.run_steps(3);
     h.get_by_label(&format!("{} Open GUI", egui_phosphor::regular::APP_WINDOW)).click();
-    h.run_steps(2);
-    assert_eq!(h.state().plugin_windows.len(), 1, "GUI window should be open");
+    // Opening happens on the GUI thread; wait for it.
+    for _ in 0..300 {
+        h.run_steps(1);
+        if h.state().gui.open_count() == 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(16));
+    }
+    assert_eq!(h.state().gui.open_count(), 1, "GUI window should be open");
     let secs: u64 = std::env::var("STUDIO_GUI_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
     for _ in 0..secs * 60 {
         h.run_steps(1);
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
-    assert_eq!(h.state().plugin_windows.len(), 1, "GUI closed unexpectedly");
+    assert_eq!(h.state().gui.open_count(), 1, "GUI closed unexpectedly");
 
     // Save (plugin state goes into the file), then reopen.
     let dir = std::env::temp_dir().join(format!("studio-gui-test-{}", std::process::id()));
@@ -272,7 +279,7 @@ fn tone3000_gui_from_app_and_state_roundtrip() {
     assert!(text.contains("StateString"), "plugin state missing from project file");
     h.state_mut().open_project(path);
     h.run_steps(2);
-    assert!(h.state().plugin_windows.is_empty(), "GUIs close when the project is replaced");
+    assert_eq!(h.state().gui.open_count(), 0, "GUIs close when the project is replaced");
     let slot = &h.state().project.track(track).unwrap().devices[0];
     assert!(slot.lv2.is_some() && slot.state.as_ref().is_some_and(|s| !s.is_empty()));
     let _ = std::fs::remove_dir_all(dir);

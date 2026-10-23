@@ -368,7 +368,7 @@ fn tone3000_gui_and_state() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    crate::lv2ui::init_x11_threads();
+    crate::lv2ui::init_x11();
     let reg = registry();
     let id = "lv2:https://www.tone3000.com/plugin";
     let info = reg.get(id).expect("TONE3000 not installed").clone();
@@ -450,4 +450,94 @@ fn engine_buffer_size_and_master_output() {
     assert_eq!(engine.master_output(), None);
     engine.set_master_output(&devices[0].1);
     assert_eq!(engine.master_output().as_deref(), Some(devices[0].0.as_str()));
+}
+
+/// Make an EGL (desktop GL) context current on this thread, as egui's renderer
+/// does on the app's main thread. Returns false if EGL is unavailable.
+#[cfg(test)]
+fn make_egl_context_current() -> bool {
+    use std::ffi::c_void;
+    type P = *mut c_void;
+    unsafe {
+        let Ok(lib) = libloading::Library::new("libEGL.so.1") else { return false };
+        let get_platform_display: libloading::Symbol<unsafe extern "C" fn(u32, P, *const i32) -> P> = lib.get(b"eglGetPlatformDisplay\0").unwrap();
+        let initialize: libloading::Symbol<unsafe extern "C" fn(P, *mut i32, *mut i32) -> u32> = lib.get(b"eglInitialize\0").unwrap();
+        let bind_api: libloading::Symbol<unsafe extern "C" fn(u32) -> u32> = lib.get(b"eglBindAPI\0").unwrap();
+        let choose_config: libloading::Symbol<unsafe extern "C" fn(P, *const i32, *mut P, i32, *mut i32) -> u32> = lib.get(b"eglChooseConfig\0").unwrap();
+        let create_context: libloading::Symbol<unsafe extern "C" fn(P, P, P, *const i32) -> P> = lib.get(b"eglCreateContext\0").unwrap();
+        let make_current: libloading::Symbol<unsafe extern "C" fn(P, P, P, P) -> u32> = lib.get(b"eglMakeCurrent\0").unwrap();
+        let get_error: libloading::Symbol<unsafe extern "C" fn() -> i32> = lib.get(b"eglGetError\0").unwrap();
+        const SURFACELESS_MESA: u32 = 0x31DD;
+        let dpy = get_platform_display(SURFACELESS_MESA, std::ptr::null_mut(), std::ptr::null());
+        if dpy.is_null() || initialize(dpy, std::ptr::null_mut(), std::ptr::null_mut()) == 0 {
+            eprintln!("EGL display/initialize failed: {:#x}", get_error());
+            return false;
+        }
+        bind_api(0x30A2); // EGL_OPENGL_API
+        let attribs = [0x3040, 0x0008, 0x3033, 0x0001, 0x3038]; // RENDERABLE_TYPE = OPENGL_BIT, SURFACE_TYPE = PBUFFER_BIT
+        let mut cfg: P = std::ptr::null_mut();
+        let mut n = 0;
+        if choose_config(dpy, attribs.as_ptr(), &mut cfg, 1, &mut n) == 0 || n == 0 {
+            eprintln!("eglChooseConfig failed: {:#x} n={n}", get_error());
+            return false;
+        }
+        let ctx = create_context(dpy, cfg, std::ptr::null_mut(), [0x3038].as_ptr());
+        if ctx.is_null() {
+            eprintln!("eglCreateContext failed: {:#x}", get_error());
+            return false;
+        }
+        let ok = make_current(dpy, std::ptr::null_mut(), std::ptr::null_mut(), ctx) != 0;
+        if !ok {
+            eprintln!("eglMakeCurrent failed: {:#x}", get_error());
+        }
+        std::mem::forget(lib);
+        ok
+    }
+}
+
+/// Regression test for the x42 GUI crash: an OpenGL (GLX) plugin GUI while an
+/// EGL context is current on the calling thread (as egui's is on the app's
+/// main thread). Through the GUI thread it must work; the old in-thread path
+/// must now only log the X error instead of killing the process.
+#[test]
+#[ignore]
+fn x42_tuner_gui_with_egl_context_current() {
+    use std::time::{Duration, Instant};
+    crate::lv2ui::init_x11();
+    let reg = registry();
+    let id = "lv2:http://gareus.org/oss/lv2/tuna#one";
+    let info = reg.get(id).expect("x42 tuner not installed").clone();
+    assert!(info.has_gui);
+    let shared = DeviceShared::new(&info);
+    let created = reg.create(id, 48000.0, shared.clone(), None).unwrap();
+    let link = created.lv2.unwrap();
+    assert!(make_egl_context_current(), "could not make an EGL context current");
+
+    // 1. Through the GUI thread: opens and keeps running without X errors.
+    let mut gui = crate::lv2ui::GuiHost::new();
+    gui.open(link.clone(), shared.clone(), "x42 tuner test".into(), 48000.0);
+    let secs: u64 = std::env::var("STUDIO_GUI_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    let t0 = Instant::now();
+    let mut msgs = vec![];
+    while t0.elapsed() < Duration::from_secs(secs) {
+        msgs.extend(gui.poll());
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(msgs.is_empty(), "GUI thread reported: {msgs:?}");
+    assert_eq!(gui.open_count(), 1, "tuner GUI should be open");
+    gui.close(&shared);
+    assert_eq!(gui.open_count(), 0);
+    println!("GUI thread: tuner GUI ran {secs} s without X errors");
+    drop(gui); // stop the GUI thread so it does not collect the errors below
+
+    // 2. The old path (GUI on the EGL thread) fails, but no longer exits.
+    crate::lv2ui::take_x_errors();
+    let mut win = crate::lv2ui::PluginWindow::open(link, shared, "x42 tuner on EGL thread".into(), 48000.0).unwrap();
+    for _ in 0..10 {
+        win.pump();
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    let errors = crate::lv2ui::take_x_errors();
+    println!("EGL thread: {errors:?}");
+    assert!(errors.iter().any(|e| e.contains("BadAccess")), "expected the GLX BadAccess to be reported, got {errors:?}");
 }

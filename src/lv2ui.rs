@@ -1,10 +1,15 @@
 //! Hosting LV2 plugin GUIs (`ui:X11UI`) in their own X11 windows.
 //!
 //! libX11 is loaded at runtime. Each GUI gets a top-level window (under
-//! Wayland sessions it runs through XWayland), `instance-access` to the running
-//! DSP instance, and is driven from the app's UI thread through the
-//! `ui:idleInterface`. GUI writes go back to the plugin: control values via
+//! Wayland sessions it runs through XWayland) and `instance-access` to the
+//! running DSP instance. GUI writes go back to the plugin: control values via
 //! the device's shared parameters, atom messages via [`Lv2Link::send_atom`].
+//!
+//! All plugin GUIs live on one dedicated thread ([`GuiHost`]), never on the
+//! app's main thread: egui keeps an EGL context current there, and GLX-based
+//! GUIs (x42, robtk/pugl) fail with `BadAccess` on `glXMakeCurrent` when
+//! another GL API's context is current on the same thread. X errors raised by
+//! plugin code are logged instead of terminating the process.
 
 use crate::device::DeviceShared;
 use crate::lv2::{
@@ -12,7 +17,10 @@ use crate::lv2::{
 };
 use libloading::Library;
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uint, c_ulong, c_void};
-use std::sync::{Arc, OnceLock};
+use std::collections::HashSet;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 type P = *mut c_void;
 type Display = c_void;
@@ -28,6 +36,19 @@ struct XEvent {
 const STRUCTURE_NOTIFY_MASK: c_long = 1 << 17;
 const DESTROY_NOTIFY: c_int = 17;
 const CLIENT_MESSAGE: c_int = 33;
+
+#[repr(C)]
+struct XErrorEvent {
+    kind: c_int,
+    display: *mut Display,
+    resource_id: c_ulong,
+    serial: c_ulong,
+    error_code: u8,
+    request_code: u8,
+    minor_code: u8,
+}
+
+type ErrorHandler = unsafe extern "C" fn(*mut Display, *mut XErrorEvent) -> c_int;
 
 macro_rules! x11_api {
     ($($field:ident = $sym:literal : fn($($arg:ty),*) -> $ret:ty;)*) => {
@@ -67,6 +88,7 @@ x11_api! {
     resize_window = "XResizeWindow": fn(*mut Display, Window, c_uint, c_uint) -> c_int;
     destroy_window = "XDestroyWindow": fn(*mut Display, Window) -> c_int;
     flush = "XFlush": fn(*mut Display) -> c_int;
+    set_error_handler = "XSetErrorHandler": fn(Option<ErrorHandler>) -> Option<ErrorHandler>;
 }
 
 static X11_API: OnceLock<Result<X11, String>> = OnceLock::new();
@@ -75,11 +97,42 @@ fn x11() -> Result<&'static X11, String> {
     X11_API.get_or_init(X11::load).as_ref().map_err(|e| e.clone())
 }
 
-/// Make Xlib thread-safe. Plugin GUIs (JUCE and others) expect this; it must
-/// run before any other Xlib call in the process, so call it from `main`.
-pub fn init_x11_threads() {
+/// X errors reported since the last [`take_x_errors`].
+static X_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+unsafe extern "C" fn on_x_error(_: *mut Display, e: *mut XErrorEvent) -> c_int {
+    let Some(e) = (unsafe { e.as_ref() }) else { return 0 };
+    let name = match e.error_code {
+        1 => "BadRequest",
+        2 => "BadValue",
+        3 => "BadWindow",
+        8 => "BadMatch",
+        9 => "BadDrawable",
+        10 => "BadAccess",
+        11 => "BadAlloc",
+        _ => "error",
+    };
+    let msg = format!("X {name} (code {}) on request {}.{}", e.error_code, e.request_code, e.minor_code);
+    eprintln!("studio: plugin GUI: {msg}");
+    if let Ok(mut v) = X_ERRORS.lock() {
+        v.push(msg);
+    }
+    0 // keep running; Xlib's default handler would exit the process
+}
+
+pub fn take_x_errors() -> Vec<String> {
+    X_ERRORS.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default()
+}
+
+/// Make Xlib thread-safe and non-fatal on errors. Plugin GUIs expect
+/// `XInitThreads`, which must run before any other Xlib call in the process,
+/// so call this from `main`.
+pub fn init_x11() {
     if let Ok(x) = x11() {
-        unsafe { (x.init_threads)() };
+        unsafe {
+            (x.init_threads)();
+            (x.set_error_handler)(Some(on_x_error));
+        }
     }
 }
 
@@ -365,6 +418,195 @@ impl Drop for PluginWindow {
             (x.destroy_window)(self.display, self.window);
             (x.flush)(self.display);
             (x.close_display)(self.display);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GUI thread
+
+enum Request {
+    Open { key: usize, link: Arc<Lv2Link>, shared: Arc<DeviceShared>, title: String, rate: f32 },
+    Close { key: usize, done: mpsc::Sender<()> },
+    CloseAll { done: mpsc::Sender<()> },
+}
+
+enum Event {
+    Opened(usize),
+    Closed(usize),
+    Failed(usize, String),
+    Error(String),
+}
+
+/// Owns the plugin GUI thread. Opening is asynchronous; closing blocks until
+/// the GUI is gone, so a plugin instance is never freed under an open GUI.
+pub struct GuiHost {
+    tx: Option<mpsc::Sender<Request>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    events: mpsc::Receiver<Event>,
+    open: HashSet<usize>,
+    pending: HashSet<usize>,
+}
+
+impl Default for GuiHost {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GuiHost {
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        let (etx, events) = mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("studio-plugin-gui".into())
+            .spawn(move || gui_thread(rx, etx))
+            .expect("spawn plugin GUI thread");
+        GuiHost { tx: Some(tx), thread: Some(thread), events, open: HashSet::new(), pending: HashSet::new() }
+    }
+
+    fn send(&self, r: Request) -> bool {
+        self.tx.as_ref().is_some_and(|tx| tx.send(r).is_ok())
+    }
+
+    fn key(shared: &Arc<DeviceShared>) -> usize {
+        Arc::as_ptr(shared) as usize
+    }
+
+    pub fn open(&mut self, link: Arc<Lv2Link>, shared: Arc<DeviceShared>, title: String, rate: f32) {
+        let key = Self::key(&shared);
+        if self.send(Request::Open { key, link, shared, title, rate }) {
+            self.pending.insert(key);
+        }
+    }
+
+    /// Open or opening.
+    pub fn is_open(&self, shared: &Arc<DeviceShared>) -> bool {
+        let k = Self::key(shared);
+        self.open.contains(&k) || self.pending.contains(&k)
+    }
+
+    #[cfg(test)]
+    pub fn open_count(&self) -> usize {
+        self.open.len()
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Close a device's GUI and wait until it is gone.
+    pub fn close(&mut self, shared: &Arc<DeviceShared>) {
+        let key = Self::key(shared);
+        if !self.is_open(shared) {
+            return;
+        }
+        let (done, wait) = mpsc::channel();
+        if self.send(Request::Close { key, done }) {
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+        }
+        self.open.remove(&key);
+        self.pending.remove(&key);
+    }
+
+    /// Close every GUI and wait until they are gone.
+    pub fn close_all(&mut self) {
+        if self.open.is_empty() && self.pending.is_empty() {
+            return;
+        }
+        let (done, wait) = mpsc::channel();
+        if self.send(Request::CloseAll { done }) {
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+        }
+        self.open.clear();
+        self.pending.clear();
+    }
+
+    /// Apply events from the GUI thread; returns messages for the user.
+    pub fn poll(&mut self) -> Vec<String> {
+        let mut msgs = vec![];
+        while let Ok(e) = self.events.try_recv() {
+            match e {
+                Event::Opened(k) => {
+                    if self.pending.remove(&k) {
+                        self.open.insert(k);
+                    }
+                }
+                Event::Closed(k) => {
+                    self.open.remove(&k);
+                    self.pending.remove(&k);
+                }
+                Event::Failed(k, why) => {
+                    self.pending.remove(&k);
+                    msgs.push(format!("Plugin GUI failed: {why}"));
+                }
+                Event::Error(why) => msgs.push(format!("Plugin GUI: {why}")),
+            }
+        }
+        msgs
+    }
+}
+
+impl Drop for GuiHost {
+    /// Close all GUIs and stop the thread.
+    fn drop(&mut self) {
+        self.tx = None; // disconnects: the thread drops its windows and exits
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn gui_thread(rx: mpsc::Receiver<Request>, events: mpsc::Sender<Event>) {
+    let mut windows: Vec<(usize, PluginWindow)> = vec![];
+    loop {
+        let mut requests = vec![];
+        match rx.recv_timeout(Duration::from_millis(16)) {
+            Ok(r) => requests.push(r),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        requests.extend(rx.try_iter());
+        for r in requests {
+            match r {
+                Request::Open { key, link, shared, title, rate } => {
+                    take_x_errors();
+                    match PluginWindow::open(link, shared, title, rate) {
+                        Ok(mut w) => {
+                            w.pump();
+                            let errors = take_x_errors();
+                            if errors.is_empty() {
+                                windows.push((key, w));
+                                let _ = events.send(Event::Opened(key));
+                            } else {
+                                drop(w);
+                                let _ = events.send(Event::Failed(key, errors.join("; ")));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = events.send(Event::Failed(key, e));
+                        }
+                    }
+                }
+                Request::Close { key, done } => {
+                    windows.retain(|(k, _)| *k != key);
+                    let _ = done.send(());
+                }
+                Request::CloseAll { done } => {
+                    windows.clear();
+                    let _ = done.send(());
+                }
+            }
+        }
+        windows.retain_mut(|(k, w)| {
+            let alive = w.pump();
+            if !alive {
+                let _ = events.send(Event::Closed(*k));
+            }
+            alive
+        });
+        for e in take_x_errors() {
+            let _ = events.send(Event::Error(e));
         }
     }
 }

@@ -81,7 +81,7 @@ fn main() -> eframe::Result {
     }
     lv2::setup_lv2_path();
     // Before any other Xlib use (winit, plugin GUIs).
-    lv2ui::init_x11_threads();
+    lv2ui::init_x11();
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()

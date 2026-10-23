@@ -3,6 +3,7 @@ mod audio;
 mod builtin;
 mod device;
 mod engine;
+mod export;
 mod lv2;
 mod lv2ui;
 mod project;

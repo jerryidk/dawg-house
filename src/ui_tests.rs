@@ -277,3 +277,76 @@ fn tone3000_gui_from_app_and_state_roundtrip() {
     assert!(slot.lv2.is_some() && slot.state.as_ref().is_some_and(|s| !s.is_empty()));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn export_song_to_wav_and_mp3() {
+    use crate::export::{ExportJob, Format};
+    use crate::project::{Clip, Note};
+    let mut h = harness();
+    // Empty timeline: nothing to export.
+    assert!(h.state().build_export_plan(0.0).is_err());
+    {
+        let app = h.state_mut();
+        let rate = app.rate() as usize;
+        // One second of a 0.5 amplitude tone on the audio track at 0.5 s.
+        let audio = app.project.tracks[0].id;
+        let data = crate::audio::AudioData::new("tone.wav".into(), vec![(0..rate).map(|i| (i as f32 * 0.05).sin() * 0.5).collect()]);
+        app.add_audio_clip(audio, data, rate as i64 / 2, "tone".into());
+        // A chord on the instrument track (built-in synth) for the first beat.
+        let inst = app.project.tracks[1].id;
+        let id = app.project.alloc_id();
+        let notes = [60u8, 64, 67].map(|pitch| Note { pitch, velocity: 100, start: 0.0, length: 1.0 }).to_vec();
+        app.project.track_mut(inst).unwrap().clips.push(Clip {
+            id,
+            content: ClipContent::Midi { notes },
+            name: "chord".into(),
+            start: 0,
+            offset: 0,
+            length: rate as u64,
+            gain: 1.0,
+            fade_in: 0,
+            fade_out: 0,
+            muted: false,
+        });
+    }
+    let rate = h.state().rate();
+    let dir = std::env::temp_dir().join(format!("studio-export-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // WAV 24-bit: length = song end (1.5 s) + 0.5 s tail.
+    let wav = dir.join("song.wav");
+    let job = ExportJob::start(h.state().build_export_plan(0.5).unwrap(), wav.clone(), Format::Wav24).unwrap();
+    let stats = job.join().unwrap();
+    let mut r = hound::WavReader::open(&wav).unwrap();
+    let spec = r.spec();
+    assert_eq!((spec.channels, spec.bits_per_sample, spec.sample_rate), (2, 24, rate));
+    assert_eq!(r.duration() as u64, stats.frames);
+    assert_eq!(stats.frames, (rate as u64 * 2));
+    let samples: Vec<i32> = r.samples::<i32>().map(|s| s.unwrap()).collect();
+    let peak_at = |from: f32, to: f32| {
+        let (a, b) = ((from * rate as f32) as usize * 2, (to * rate as f32) as usize * 2);
+        samples[a..b].iter().map(|s| s.unsigned_abs()).max().unwrap() as f32 / 8_388_607.0
+    };
+    assert!(peak_at(0.0, 0.4) > 0.01, "synth chord should sound in the first 0.4 s");
+    assert!(peak_at(0.6, 1.4) > 0.3, "audio clip should sound from 0.5 s");
+    assert!(peak_at(1.8, 2.0) < 0.001, "tail after everything ended should be silent");
+    println!("WAV: {} frames, peak {:.2}", stats.frames, stats.peak);
+
+    // MP3 320 kbps (when libmp3lame is available).
+    if crate::export::mp3_available().is_ok() {
+        let mp3 = dir.join("song.mp3");
+        ExportJob::start(h.state().build_export_plan(0.5).unwrap(), mp3.clone(), Format::Mp3 { kbps: 320 }).unwrap().join().unwrap();
+        let bytes = std::fs::read(&mp3).unwrap();
+        // MPEG audio frame sync, and roughly 2 s at 320 kbps (= 80 kB).
+        assert!(bytes.len() > 4 && bytes[0] == 0xFF && bytes[1] & 0xE0 == 0xE0, "not an MPEG audio stream");
+        assert!((60_000..100_000).contains(&bytes.len()), "unexpected MP3 size {}", bytes.len());
+        println!("MP3: {} bytes", bytes.len());
+    }
+
+    // The window flow: open with Ctrl+E, and the format radio buttons exist.
+    h.key_press_modifiers(Modifiers::COMMAND, Key::E);
+    h.run_steps(2);
+    assert!(h.state().export.open);
+    h.get_by_label("MP3 192 kbps");
+    let _ = std::fs::remove_dir_all(dir);
+}

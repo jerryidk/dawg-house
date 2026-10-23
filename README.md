@@ -38,6 +38,8 @@ The window has three foldable panels: **Snippets** (one column per track), **Tim
 * **Devices:** in the **Devices** tab, add LV2 or built-in devices, bypass, reorder and remove them, and edit their parameters. Plugins that ship their own interface (e.g. TONE3000) have an **Open GUI** button, which opens it in a separate window (X11; XWayland on Wayland desktops). A plugin's internal state, such as a loaded amp model, is saved in the project.
 * **Navigation:** Space play/pause, Home to the start, Ctrl+wheel zoom, Shift+wheel scroll. Click the ruler to move the playhead.
 * **Files:** save and open projects (`.studio`, JSON) and import WAV files (Ctrl+I, or drop them on a lane).
+* **Export:** **File → Export audio…** (Ctrl+E) renders the timeline offline, faster than real time and with every device and plugin, to WAV (16-bit, 24-bit or 32-bit float) or MP3 (320/192 kbps, via the system's `libmp3lame0`). A tail setting lets reverbs and note releases ring out after the last clip.
+* **Audio setup:** the picker next to the master volume chooses the output device (saved per project). The status bar's frames picker sets the period size (32–4096 frames) and shows the latency of each choice. Under PipeWire this forces the graph quantum for all apps.
 
 ## Architecture
 
@@ -52,6 +54,7 @@ src/
   audio.rs      audio sources, WAV import/resampling, disk-writer for recording
   project.rs    model: TrackKind, Snippet, Take, Clip, ClipContent, Note, DeviceSlot, undo history
   song.rs       pure song logic: linked placements → playback list, snippet loops, loop takes
+  export.rs     offline render to WAV / MP3 (libmp3lame via dlopen)
   app.rs        app state, transport, device panel/browser, project I/O
   snippets.rs   snippet columns and the Takes tab
   timeline.rs   linear timeline (headers, lanes, placements, non-destructive clip editing)
@@ -73,7 +76,7 @@ The UI uses [egui](https://github.com/emilk/egui) (via `eframe`, OpenGL; Wayland
 ## Limits / next steps
 
 * LV2: only X11 plugin GUIs are hosted (no GTK/Qt GUIs). GUIs that only talk through atom output ports (e.g. some analyzers) get no data back. The worker extension is not implemented (convolvers need it), and MIDI-only plugins are not hosted.
-* There is no mixdown/export, automation or time-stretching yet. Recording has no latency compensation, so takes may sit a few milliseconds late against the grid. Comping (combining bars from different takes) is not implemented.
+* There is no automation or time-stretching yet. Export covers the whole timeline (no range selection). Recording has no latency compensation, so takes may sit a few milliseconds late against the grid. Comping (combining bars from different takes) is not implemented.
 * Import is WAV only.
 
 ## Tests

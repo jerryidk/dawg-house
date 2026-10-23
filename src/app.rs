@@ -76,6 +76,21 @@ impl MidiTake {
     }
 }
 
+/// State of the export window.
+pub struct ExportUi {
+    pub open: bool,
+    pub format: crate::export::Format,
+    /// Seconds rendered after the last clip ends (reverb/release tails).
+    pub tail: f32,
+    pub job: Option<crate::export::ExportJob>,
+}
+
+impl Default for ExportUi {
+    fn default() -> Self {
+        ExportUi { open: false, format: crate::export::Format::Wav24, tail: 2.0, job: None }
+    }
+}
+
 struct Browser {
     track: Id,
     filter: String,
@@ -106,6 +121,7 @@ pub struct StudioApp {
     pub snippet_rects: Vec<(Id, egui::Rect)>,
     /// Open plugin GUI windows.
     pub plugin_windows: Vec<crate::lv2ui::PluginWindow>,
+    pub export: ExportUi,
     pub audio_ports: Vec<String>,
     /// Playback devices (client name, ports) for the master output.
     pub output_devices: Vec<(String, Vec<String>)>,
@@ -152,6 +168,7 @@ impl StudioApp {
             lane_rects: vec![],
             snippet_rects: vec![],
             plugin_windows: vec![],
+            export: ExportUi::default(),
             audio_ports: vec![],
             output_devices: vec![],
             master_device: None,
@@ -986,6 +1003,9 @@ impl StudioApp {
         if ctx.input_mut(|i| i.consume_shortcut(&ctrl(Key::I))) {
             self.import_dialog();
         }
+        if ctx.input_mut(|i| i.consume_shortcut(&ctrl(Key::E))) {
+            self.export.open = true;
+        }
         if ctx.egui_wants_keyboard_input() {
             return; // typing in a text field
         }
@@ -1053,6 +1073,9 @@ impl StudioApp {
                 ui.separator();
                 if ui.add(egui::Button::new("Import audio…").shortcut_text("Ctrl+I")).clicked() {
                     self.import_dialog();
+                }
+                if ui.add(egui::Button::new("Export audio…").shortcut_text("Ctrl+E")).clicked() {
+                    self.export.open = true;
                 }
                 ui.separator();
                 if ui.button("Quit").clicked() {
@@ -1264,6 +1287,158 @@ impl StudioApp {
             match self.engine.set_buffer_size(n) {
                 Ok(()) => self.notify(format!("Requested {n} frames ({:.1} ms)", ms(n))),
                 Err(e) => self.notify(e),
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Export
+
+    /// End of the last clip on the timeline (samples).
+    pub fn song_end(&self) -> i64 {
+        self.project.tracks.iter().flat_map(|t| t.clips.iter().filter(|c| !c.muted).map(|c| c.end())).max().unwrap_or(0)
+    }
+
+    /// Prepare an offline render of the song: the playback list plus fresh
+    /// copies of every device with current parameters and plugin state.
+    pub fn build_export_plan(&self, tail_secs: f32) -> Result<crate::export::RenderPlan, String> {
+        let rate = self.rate();
+        let end = self.song_end();
+        if end <= 0 {
+            return Err("The timeline is empty: place snippets or clips on it first".into());
+        }
+        let any_solo = self.project.tracks.iter().any(|t| t.solo);
+        let mut tracks = vec![];
+        for t in &self.project.tracks {
+            let mut devices = vec![];
+            for slot in &t.devices {
+                let Some(info) = self.registry.get(&slot.device_id) else { continue };
+                let shared = DeviceShared::new(info);
+                if let Some(live) = &slot.shared {
+                    for (dst, src) in shared.params.iter().zip(&live.params) {
+                        dst.set(src.get());
+                    }
+                    shared.bypass.store(live.bypass.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
+                let state = slot.lv2.as_ref().and_then(|l| crate::lv2::save_state(l)).or_else(|| slot.state.clone());
+                let created = self.registry.create(&slot.device_id, rate as f64, shared, state.as_deref()).map_err(|e| format!("{}: {e}", slot.name))?;
+                devices.push(created.device);
+            }
+            tracks.push(crate::export::OfflineTrack {
+                id: t.id,
+                kind: t.kind,
+                gain: db_to_gain(t.volume_db),
+                pan: t.pan,
+                audible: !t.mute && (!any_solo || t.solo),
+                devices,
+            });
+        }
+        Ok(crate::export::RenderPlan {
+            rate,
+            length: end as u64 + (tail_secs.max(0.0) * rate as f32) as u64,
+            arrangement: song::compile_song(&self.project, &self.sources, rate),
+            tracks,
+            master_gain: db_to_gain(self.project.master_db),
+        })
+    }
+
+    /// Start exporting to `path`.
+    pub fn start_export(&mut self, path: PathBuf) {
+        let plan = match self.build_export_plan(self.export.tail) {
+            Ok(p) => p,
+            Err(e) => return self.notify(e),
+        };
+        match crate::export::ExportJob::start(plan, path, self.export.format) {
+            Ok(job) => self.export.job = Some(job),
+            Err(e) => self.notify(format!("Export failed: {e}")),
+        }
+    }
+
+    fn poll_export(&mut self) {
+        if !self.export.job.as_ref().is_some_and(|j| j.is_finished()) {
+            return;
+        }
+        let job = self.export.job.take().unwrap();
+        let path = job.path.clone();
+        match job.join() {
+            Ok(stats) => {
+                let db = crate::util::gain_to_db(stats.peak);
+                let warn = if stats.peak > 1.0 { " — clipped! lower the master volume" } else { "" };
+                self.notify(format!("Exported {} ({}, peak {db:.1} dBFS){warn}", path.display(), format_time(stats.frames as i64, self.rate())));
+            }
+            Err(e) => self.notify(format!("Export: {e}")),
+        }
+    }
+
+    fn export_window(&mut self, ctx: &egui::Context) {
+        self.poll_export();
+        if !self.export.open {
+            return;
+        }
+        let mut open = true;
+        let mut choose_file = false;
+        let rate = self.rate();
+        let end = self.song_end();
+        let mp3 = crate::export::mp3_available();
+        egui::Window::new(format!("{} Export audio", icon::FILE_AUDIO)).open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            let running = self.export.job.is_some();
+            ui.add_enabled_ui(!running, |ui| {
+                theme::section_label(ui, "Format");
+                for f in crate::export::Format::ALL {
+                    let is_mp3 = matches!(f, crate::export::Format::Mp3 { .. });
+                    let r = ui.add_enabled(!is_mp3 || mp3.is_ok(), egui::RadioButton::new(self.export.format == f, f.label()));
+                    let r = match (&mp3, is_mp3) {
+                        (Err(why), true) => r.on_disabled_hover_text(why),
+                        _ => r,
+                    };
+                    if r.clicked() {
+                        self.export.format = f;
+                    }
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Tail");
+                    ui.add(egui::DragValue::new(&mut self.export.tail).range(0.0..=30.0).speed(0.1).suffix(" s"))
+                        .on_hover_text("Extra time after the last clip so reverbs and note releases can ring out");
+                });
+                ui.label(
+                    RichText::new(format!(
+                        "Song: {} + {:.1} s tail · {:.1} kHz stereo · rendered offline with all devices",
+                        format_time(end, rate),
+                        self.export.tail,
+                        rate as f32 / 1000.0
+                    ))
+                    .small()
+                    .color(TEXT_DIM),
+                );
+            });
+            ui.add_space(6.0);
+            match &self.export.job {
+                Some(job) => {
+                    ui.add(egui::ProgressBar::new(job.progress.get()).show_percentage());
+                    ui.label(RichText::new(job.path.display().to_string()).small().color(TEXT_DIM));
+                    if ui.button("Cancel").clicked() {
+                        job.cancel();
+                    }
+                }
+                None => {
+                    let ok = end > 0;
+                    if ui.add_enabled(ok, egui::Button::new(format!("{} Export…", icon::EXPORT))).on_disabled_hover_text("The timeline is empty").clicked() {
+                        choose_file = true;
+                    }
+                }
+            }
+        });
+        if !open && self.export.job.is_none() {
+            self.export.open = false;
+        }
+        if choose_file {
+            let ext = self.export.format.extension();
+            let stem = self.project_path.as_ref().and_then(|p| p.file_stem()).map_or("song".to_string(), |s| s.to_string_lossy().into_owned());
+            let dir = self.project.audio_dir.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            let _ = std::fs::create_dir_all(&dir);
+            if let Some(path) = rfd::FileDialog::new().add_filter(ext.to_uppercase(), &[ext]).set_directory(&dir).set_file_name(format!("{stem}.{ext}")).save_file() {
+                self.start_export(path.with_extension(ext));
             }
         }
     }
@@ -1644,6 +1819,7 @@ impl eframe::App for StudioApp {
         }
 
         self.browser_window(&ctx);
+        self.export_window(&ctx);
 
         if self.arrangement_dirty {
             self.arrangement_dirty = false;

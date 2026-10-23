@@ -1,0 +1,2 @@
+[env]
+PKG_CONFIG_PATH = { value = "build-support/pkgconfig", relative = true }

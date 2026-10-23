@@ -1,0 +1,8 @@
+# Build-time stub: the `jack` crate loads libjack.so.0 at runtime (dlopen),
+# so no headers or link flags are needed. This lets the project build on
+# systems without libjack development packages (e.g. pipewire-jack only).
+Name: jack
+Description: JACK Audio Connection Kit (runtime-loaded stub)
+Version: 1.9.22
+Libs:
+Cflags:

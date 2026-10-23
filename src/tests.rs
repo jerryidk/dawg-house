@@ -422,3 +422,32 @@ fn tone3000_gui_and_state() {
     assert_eq!(state.len(), state2.len());
     println!("state restored into a new instance ({} entries)", state2.len());
 }
+
+/// Buffer size changes and master output routing through a real JACK server.
+#[test]
+#[ignore]
+fn engine_buffer_size_and_master_output() {
+    use crate::engine::Engine;
+    use std::time::{Duration, Instant};
+    let engine = Engine::new("studio-io-test");
+    assert!(engine.is_running(), "{:?}", engine.error);
+    let before = engine.buffer_size();
+    let target = if before == 512 { 1024 } else { 512 };
+    engine.set_buffer_size(target).unwrap();
+    let t0 = Instant::now();
+    while engine.buffer_size() != target && t0.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    println!("buffer size {before} -> {}", engine.buffer_size());
+    assert_eq!(engine.buffer_size(), target);
+    engine.set_buffer_size(before).unwrap();
+
+    let devices = engine.playback_devices();
+    println!("playback devices: {devices:?}");
+    assert!(!devices.is_empty());
+    assert_eq!(engine.master_output().as_deref(), Some(devices[0].0.as_str()), "master autoconnects to the first device");
+    engine.set_master_output(&[]);
+    assert_eq!(engine.master_output(), None);
+    engine.set_master_output(&devices[0].1);
+    assert_eq!(engine.master_output().as_deref(), Some(devices[0].0.as_str()));
+}

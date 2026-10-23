@@ -107,6 +107,10 @@ pub struct StudioApp {
     /// Open plugin GUI windows.
     pub plugin_windows: Vec<crate::lv2ui::PluginWindow>,
     pub audio_ports: Vec<String>,
+    /// Playback devices (client name, ports) for the master output.
+    pub output_devices: Vec<(String, Vec<String>)>,
+    /// Device the master output is connected to right now.
+    pub master_device: Option<String>,
     pub midi_ports: Vec<String>,
     pub midi_takes: HashMap<Id, MidiTake>,
     takes: Vec<AudioTake>,
@@ -149,6 +153,8 @@ impl StudioApp {
             snippet_rects: vec![],
             plugin_windows: vec![],
             audio_ports: vec![],
+            output_devices: vec![],
+            master_device: None,
             midi_ports: vec![],
             midi_takes: HashMap::new(),
             takes: vec![],
@@ -208,6 +214,8 @@ impl StudioApp {
     fn refresh_ports(&mut self) {
         self.audio_ports = self.engine.source_ports(AUDIO_PORT);
         self.midi_ports = self.engine.source_ports(MIDI_PORT);
+        self.output_devices = self.engine.playback_devices();
+        self.master_device = self.engine.master_output();
         self.ports_refreshed = Some(Instant::now());
     }
 
@@ -869,6 +877,12 @@ impl StudioApp {
                 self.restore_device(id, i);
             }
         }
+        if let Some(name) = self.project.master_output.clone()
+            && let Some((_, ports)) = self.engine.playback_devices().into_iter().find(|(d, _)| *d == name)
+        {
+            self.engine.set_master_output(&ports);
+        }
+        self.refresh_ports();
         self.project_path = Some(path.clone());
         self.notify(if missing > 0 {
             format!("Opened {} ({missing} audio files missing)", path.display())
@@ -1171,10 +1185,87 @@ impl StudioApp {
                 theme::meter(ui, 140.0, self.master_meter, "Master output");
                 ui.add(egui::Slider::new(&mut self.project.master_db, -60.0..=6.0).show_value(false).trailing_fill(true))
                     .on_hover_text(format!("Master {:.1} dB", self.project.master_db));
+                self.master_output_picker(ui);
                 ui.label(RichText::new(format!("{} Master", icon::SPEAKER_HIGH)).color(TEXT_DIM));
             });
         });
         ui.add_space(4.0);
+    }
+
+    /// Master output device selector (next to the master volume).
+    fn master_output_picker(&mut self, ui: &mut egui::Ui) {
+        if !self.engine.is_running() {
+            return;
+        }
+        let current = self.master_device.clone().unwrap_or_else(|| "Not connected".into());
+        let mut choice: Option<Option<usize>> = None;
+        egui::ComboBox::from_id_salt("master_output")
+            .selected_text(RichText::new(short_name(&current, 26)).small())
+            .width(170.0)
+            .show_ui(ui, |ui| {
+                theme::section_label(ui, "Master output device");
+                for (i, (name, ports)) in self.output_devices.iter().enumerate() {
+                    let label = format!("{name}  ({} ch)", ports.len());
+                    if ui.selectable_label(self.master_device.as_deref() == Some(name.as_str()), label).clicked() {
+                        choice = Some(Some(i));
+                    }
+                }
+                if self.output_devices.is_empty() {
+                    ui.label(RichText::new("No playback devices found").color(TEXT_DIM));
+                }
+                ui.separator();
+                if ui.selectable_label(self.master_device.is_none(), "Not connected").clicked() {
+                    choice = Some(None);
+                }
+            })
+            .response
+            .on_hover_text("Where the master output plays: the master L/R go to the device's first two channels");
+        match choice {
+            Some(Some(i)) => {
+                let (name, ports) = self.output_devices[i].clone();
+                self.engine.set_master_output(&ports);
+                self.project.master_output = Some(name.clone());
+                self.master_device = Some(name);
+            }
+            Some(None) => {
+                self.engine.set_master_output(&[]);
+                self.project.master_output = None;
+                self.master_device = None;
+            }
+            None => {}
+        }
+    }
+
+    /// Period size selector with the latency each choice gives.
+    fn buffer_size_picker(&mut self, ui: &mut egui::Ui) {
+        let rate = self.rate().max(1) as f32;
+        let current = self.engine.buffer_size();
+        let ms = |n: u32| n as f32 / rate * 1000.0;
+        let mut pick = None;
+        egui::ComboBox::from_id_salt("buffer_size")
+            .selected_text(RichText::new(format!("{current} frames · {:.1} ms", ms(current))).color(TEXT_DIM))
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                theme::section_label(ui, "Frames per period — latency");
+                for n in [32u32, 64, 128, 256, 512, 1024, 2048, 4096] {
+                    let text = format!("{n:>5} frames   {:>6.1} ms   (round trip ≈ {:.1} ms)", ms(n), 2.0 * ms(n));
+                    if ui.selectable_label(n == current, RichText::new(text).monospace()).clicked() {
+                        pick = Some(n);
+                    }
+                }
+            })
+            .response
+            .on_hover_text(if self.engine.pipewire {
+                "Smaller = lower latency but more CPU and risk of xruns.\nUnder PipeWire this forces the quantum of the whole audio graph."
+            } else {
+                "Smaller = lower latency but more CPU and risk of xruns."
+            });
+        if let Some(n) = pick {
+            match self.engine.set_buffer_size(n) {
+                Ok(()) => self.notify(format!("Requested {n} frames ({:.1} ms)", ms(n))),
+                Err(e) => self.notify(e),
+            }
+        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -1183,9 +1274,11 @@ impl StudioApp {
             if e.is_running() {
                 let backend = if e.pipewire { "PipeWire (JACK)" } else { "JACK" };
                 let rate = e.sample_rate;
-                let ms = e.buffer_size as f32 / rate as f32 * 1000.0;
                 ui.label(RichText::new(format!("{} {backend}", icon::PLUGS)).color(theme::SOLO));
-                ui.label(RichText::new(format!("{:.1} kHz · {} frames ({ms:.1} ms) · DSP {:.0}% · xruns {}", rate as f32 / 1000.0, e.buffer_size, e.cpu_load(), e.shared.xruns.load(Ordering::Relaxed))).color(TEXT_DIM));
+                ui.label(RichText::new(format!("{:.1} kHz", rate as f32 / 1000.0)).color(TEXT_DIM));
+                self.buffer_size_picker(ui);
+                let e = &self.engine;
+                ui.label(RichText::new(format!("DSP {:.0}% · xruns {}", e.cpu_load(), e.shared.xruns.load(Ordering::Relaxed))).color(TEXT_DIM));
             } else {
                 ui.label(RichText::new(format!("{} Audio engine offline", icon::PLUGS)).color(REC))
                     .on_hover_text(e.error.clone().unwrap_or_else(|| "The JACK server shut down".into()));
@@ -1575,4 +1668,9 @@ impl eframe::App for StudioApp {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+/// Shorten a long device name for compact display.
+fn short_name(s: &str, max: usize) -> String {
+    if s.chars().count() > max { format!("{}…", s.chars().take(max - 1).collect::<String>()) } else { s.to_string() }
 }

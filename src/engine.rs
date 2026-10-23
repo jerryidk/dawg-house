@@ -78,6 +78,8 @@ pub struct EngineShared {
     pub metro_anchor: AtomicI64,
     /// Frames captured in the current/last recording.
     pub recorded_frames: AtomicI64,
+    /// Current JACK period (frames per cycle), updated by the server.
+    pub buffer_size: AtomicU32,
 }
 
 pub enum PlayContent {
@@ -282,9 +284,40 @@ fn push_event(events: &mut Vec<MidiEvent>, e: MidiEvent) {
     }
 }
 
+/// Run a track's device chain in place. On instrument tracks only the first
+/// device (the instrument) receives the notes. Shared with offline export.
+pub(crate) fn run_chain(devices: &mut [Box<dyn Device>], kind: TrackKind, l: &mut [f32], r: &mut [f32], midi: &[MidiEvent]) {
+    let mut ctx = ProcessContext { left: l, right: r, midi };
+    for (i, d) in devices.iter_mut().enumerate() {
+        d.process(&mut ctx);
+        if i == 0 && kind == TrackKind::Instrument {
+            ctx.midi = &[];
+        }
+    }
+}
+
+/// Apply fader gain and balance-style pan and add the track into the mix.
+/// Returns the post-fader peaks. Shared with offline export.
+pub(crate) fn mix_into(l: &[f32], r: &[f32], ml: &mut [f32], mr: &mut [f32], gain: f32, pan: f32, audible: bool) -> (f32, f32) {
+    let pan = pan.clamp(-1.0, 1.0);
+    let gl = gain * if pan > 0.0 { 1.0 - pan } else { 1.0 };
+    let gr = gain * if pan < 0.0 { 1.0 + pan } else { 1.0 };
+    let (mut pl, mut pr) = (0f32, 0f32);
+    if audible {
+        for i in 0..l.len().min(ml.len()) {
+            let (a, b) = (l[i] * gl, r[i] * gr);
+            pl = pl.max(a.abs());
+            pr = pr.max(b.abs());
+            ml[i] += a;
+            mr[i] += b;
+        }
+    }
+    (pl, pr)
+}
+
 /// Render clips for timeline range `pos..pos + l.len()` into `l`/`r`; MIDI
 /// events are stamped `frame_offset` + their position in the range.
-fn render_clips(clips: &[PlayClip], pos: i64, l: &mut [f32], r: &mut [f32], events: &mut Vec<MidiEvent>, frame_offset: usize) {
+pub(crate) fn render_clips(clips: &[PlayClip], pos: i64, l: &mut [f32], r: &mut [f32], events: &mut Vec<MidiEvent>, frame_offset: usize) {
     let n = l.len() as i64;
     for c in clips {
         let (cs, ce) = (c.start, c.start + c.length as i64);
@@ -325,6 +358,11 @@ fn render_clips(clips: &[PlayClip], pos: i64, l: &mut [f32], r: &mut [f32], even
 }
 
 impl jack::ProcessHandler for Processor {
+    fn buffer_size(&mut self, _: &Client, size: jack::Frames) -> Control {
+        self.shared.buffer_size.store(size, Ordering::Relaxed);
+        Control::Continue
+    }
+
     fn process(&mut self, _: &Client, ps: &ProcessScope) -> Control {
         self.handle_commands();
         let shared = self.shared.clone();
@@ -437,34 +475,10 @@ impl jack::ProcessHandler for Processor {
                 }
             }
 
-            // ---- Device chain
-            {
-                let mut ctx = ProcessContext { left: bl, right: br, midi: &t.events };
-                for (i, d) in t.devices.iter_mut().enumerate() {
-                    d.process(&mut ctx);
-                    if i == 0 && t.kind == TrackKind::Instrument {
-                        // Only the first device (the instrument) consumes notes.
-                        ctx.midi = &[];
-                    }
-                }
-            }
-
-            // ---- Fader, pan, solo/mute
-            let gain = sh.gain.get();
-            let pan = sh.pan.get().clamp(-1.0, 1.0);
-            let gl = gain * if pan > 0.0 { 1.0 - pan } else { 1.0 };
-            let gr = gain * if pan < 0.0 { 1.0 + pan } else { 1.0 };
+            // ---- Device chain, then fader / pan / solo / mute into the mix
+            run_chain(&mut t.devices, t.kind, bl, br, &t.events);
             let audible = !sh.mute.load(Ordering::Relaxed) && (!any_solo || sh.solo.load(Ordering::Relaxed));
-            let (mut pl, mut pr) = (0f32, 0f32);
-            if audible {
-                for i in 0..n {
-                    let (l, r) = (bl[i] * gl, br[i] * gr);
-                    pl = pl.max(l.abs());
-                    pr = pr.max(r.abs());
-                    ml[i] += l;
-                    mr[i] += r;
-                }
-            }
+            let (pl, pr) = mix_into(bl, br, &mut ml[..n], &mut mr[..n], sh.gain.get(), sh.pan.get(), audible);
             sh.out_peak[0].max(pl);
             sh.out_peak[1].max(pr);
         }
@@ -543,7 +557,6 @@ pub struct Engine {
     arrangement: Arc<ArcSwap<Arrangement>>,
     retired: Vec<Arc<Arrangement>>,
     pub sample_rate: u32,
-    pub buffer_size: u32,
     pub error: Option<String>,
     /// True when libjack is PipeWire's JACK implementation.
     pub pipewire: bool,
@@ -567,7 +580,6 @@ impl Engine {
             arrangement: arrangement.clone(),
             retired: vec![],
             sample_rate: 48000,
-            buffer_size: 0,
             error: None,
             pipewire: false,
             offline_devices: Default::default(),
@@ -576,7 +588,7 @@ impl Engine {
             Ok((client, garbage, midi_rec)) => {
                 let c = client.as_client();
                 engine.sample_rate = c.sample_rate();
-                engine.buffer_size = c.buffer_size();
+                engine.shared.buffer_size.store(c.buffer_size(), Ordering::Relaxed);
                 engine.pipewire = libjack_is_pipewire();
                 engine.garbage = Some(garbage);
                 engine.midi_rec = Some(midi_rec);
@@ -734,10 +746,56 @@ impl Engine {
     }
 
     fn autoconnect_master(&self) {
+        if let Some((_, ports)) = self.playback_devices().into_iter().next() {
+            self.set_master_output(&ports);
+        }
+    }
+
+    /// Frames per JACK cycle (0 when offline).
+    pub fn buffer_size(&self) -> u32 {
+        self.shared.buffer_size.load(Ordering::Relaxed)
+    }
+
+    /// Ask the server for a new period size. Under PipeWire this forces the
+    /// graph quantum. The actual size arrives via the buffer-size callback.
+    pub fn set_buffer_size(&self, frames: u32) -> Result<(), String> {
+        let c = self.client().ok_or("audio engine offline")?;
+        c.set_buffer_size(frames).map_err(|e| format!("could not set buffer size to {frames}: {e}"))
+    }
+
+    /// Output devices: hardware playback ports grouped by client, in order.
+    pub fn playback_devices(&self) -> Vec<(String, Vec<String>)> {
+        let Some(c) = self.client() else { return vec![] };
+        let mut devices: Vec<(String, Vec<String>)> = vec![];
+        for port in c.ports(None, Some(AUDIO_PORT), PortFlags::IS_INPUT | PortFlags::IS_PHYSICAL) {
+            let client = port.split(':').next().unwrap_or("").to_string();
+            match devices.iter_mut().find(|(d, _)| *d == client) {
+                Some((_, ports)) => ports.push(port),
+                None => devices.push((client, vec![port])),
+            }
+        }
+        devices
+    }
+
+    /// Client name of the device the master output currently feeds.
+    pub fn master_output(&self) -> Option<String> {
+        let c = self.client()?;
+        let port = c.port_by_name(&self.port_name("master_out_L"))?;
+        port.get_connections().first().map(|p| p.split(':').next().unwrap_or("").to_string())
+    }
+
+    /// Route the master output to `ports` (L to the first, R to the second;
+    /// a mono device gets both). An empty slice disconnects the master.
+    pub fn set_master_output(&self, ports: &[String]) {
         let Some(c) = self.client() else { return };
-        let playback = c.ports(None, Some(AUDIO_PORT), PortFlags::IS_INPUT | PortFlags::IS_PHYSICAL);
-        for (side, dst) in ["master_out_L", "master_out_R"].iter().zip(playback.iter()) {
-            let _ = c.connect_ports_by_name(&self.port_name(side), dst);
+        for (i, side) in ["master_out_L", "master_out_R"].iter().enumerate() {
+            let name = self.port_name(side);
+            if let Some(p) = c.port_by_name(&name) {
+                let _ = c.disconnect(&p);
+            }
+            if let Some(dst) = ports.get(i).or(ports.first()) {
+                let _ = c.connect_ports_by_name(&name, dst);
+            }
         }
     }
 

@@ -180,6 +180,9 @@ pub struct Project {
     pub master_db: f32,
     /// Directory where new recordings are written.
     pub audio_dir: PathBuf,
+    /// Playback device (JACK client name) the master output goes to.
+    #[serde(default)]
+    pub master_output: Option<String>,
 }
 
 pub const TRACK_COLORS: [[u8; 3]; 8] = [
@@ -209,6 +212,7 @@ impl Default for Project {
             snap: true,
             master_db: 0.0,
             audio_dir: PathBuf::from(home).join("Music/Studio").join(format!("session-{stamp}")).join("audio"),
+            master_output: None,
         }
     }
 }

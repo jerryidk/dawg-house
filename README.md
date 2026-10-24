@@ -38,6 +38,7 @@ The window has three foldable panels: **Snippets** (one column per track), **Tim
 * **Recording on the timeline:** with the song playing, arm tracks and press **R** to record free clips at the playhead. Audio is written as 32-bit float WAV to `~/Music/Studio/session-*/audio/`. MIDI becomes a MIDI clip.
 * **Editing:** drag a clip to move it (also between tracks of the same kind), drag its edges to trim, and drag the top handles of audio clips for fades. **S** splits at the playhead, **Ctrl+D** duplicates, **Del** deletes, **Ctrl+Z / Ctrl+Shift+Z** undo and redo. Snap follows the visible grid; hold **Alt** to bypass it.
 * **Piano roll:** double-click an instrument lane to create a MIDI clip. In the **Editor** tab, click to add a note, drag to move, drag the right edge to resize, and right-click to delete. Drag in the velocity lane to set velocity. **Q** quantizes.
+* **Instruments:** instrument tracks play MIDI into their first device: the built-in synth, or an LV2 instrument such as the AVL drum kits (e.g. *Black Pearl Drumkit*). **Change instrument** in the Devices tab swaps it. Drum kits load their samples in the background (LV2 worker extension). *Multi* kits are mixed down to stereo using the plugin's own left/right port markings.
 * **Devices:** in the **Devices** tab, add LV2 or built-in devices, bypass, reorder and remove them, and edit their parameters. Plugins that ship their own interface (e.g. TONE3000) have an **Open GUI** button, which opens it in a separate window (X11; XWayland on Wayland desktops). A plugin's internal state, such as a loaded amp model, is saved in the project.
 * **Editor tab:** timeline clips and snippet takes use the same editors. MIDI opens in the piano roll and audio in the **waveform editor**. The editor shows the selected clip, the selected snippet's active take, or a take opened with **Edit** in the Takes tab. The waveform editor draws the audio against the region's own bars and beats (the snippet's tempo and meter for takes). Zoom with Ctrl+wheel, −/+ or Fit. Drag the audio to slip it against the grid (snapped; hold Alt for free movement), drag the edges to trim timeline clips, drag the top corners for fades, and set gain. A take's gain and fades apply on every loop pass.
 * **Navigation:** Space play/pause, Home to the start, Ctrl+wheel zoom, Shift+wheel scroll. Click the ruler to move the playhead.
@@ -52,7 +53,7 @@ src/
   main.rs       entry point, pw-jack re-exec, CLI
   device.rs     Device trait, DeviceInfo/ParamInfo, DeviceRegistry   ← extension point
   builtin.rs    built-in devices (Basic Synth, Utility)
-  lv2.rs        LV2 host on liblilv (dlopen): discovery, URID map, options, MIDI→atom, state save/restore
+  lv2.rs        LV2 host on liblilv (dlopen): discovery, URID map, options, worker, MIDI→atom, state, multi-out downmix
   lv2ui.rs      plugin GUI windows (X11UI via dlopen'd libX11, instance-access, idle/resize)
   engine.rs     JACK real-time engine: tracks, device chains, clip playback, recording
   audio.rs      audio sources, WAV import/resampling, disk-writer for recording
@@ -80,7 +81,7 @@ The UI uses [egui](https://github.com/emilk/egui) (via `eframe`, OpenGL; Wayland
 
 ## Limits / next steps
 
-* LV2: only X11 plugin GUIs are hosted (no GTK/Qt GUIs). GUIs that only talk through atom output ports (e.g. some analyzers) get no data back. The worker extension is not implemented (convolvers need it), and MIDI-only plugins are not hosted.
+* LV2: only X11 plugin GUIs are hosted (no GTK/Qt GUIs). MIDI-only plugins (MIDI in, MIDI out, no audio) are not hosted. Multi-output instruments are downmixed to the track's stereo (no per-output routing to separate tracks yet).
 * There is no automation or time-stretching yet. Export covers the whole timeline (no range selection). Recording has no latency compensation, so takes may sit a few milliseconds late against the grid. Comping (combining bars from different takes) is not implemented.
 * Import is WAV only.
 

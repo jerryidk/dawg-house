@@ -274,6 +274,7 @@ pub struct PluginWindow {
     _features: Box<UiFeatures>,
     /// Last values sent to the GUI: (port, value).
     sent: Vec<(u32, f32)>,
+    event_buf: Vec<u8>,
     closed: bool,
 }
 
@@ -296,7 +297,13 @@ impl PluginWindow {
             (x.set_wm_protocols)(display, window, &mut wm_delete, 1);
             (x.select_input)(display, window, STRUCTURE_NOTIFY_MASK);
 
+            // Start receiving the plugin's atom output events (drop stale ones).
+            link.gui_open.store(true, std::sync::atomic::Ordering::Relaxed);
+            let mut stale = Vec::new();
+            while link.next_dsp_event(&mut stale).is_some() {}
+
             let fail = |msg: String| {
+                link.gui_open.store(false, std::sync::atomic::Ordering::Relaxed);
                 (x.destroy_window)(display, window);
                 (x.close_display)(display);
                 Err(msg)
@@ -355,7 +362,7 @@ impl PluginWindow {
                 .filter(|p| !p.is_null());
             (x.map_raised)(display, window);
             (x.flush)(display);
-            Ok(PluginWindow { shared, display, window, wm_delete, desc, handle, idle, ctrl, _features: features, sent: vec![], closed: false })
+            Ok(PluginWindow { shared, event_buf: Vec::with_capacity(4096), display, window, wm_delete, desc, handle, idle, ctrl, _features: features, sent: vec![], closed: false })
         }
     }
 
@@ -396,6 +403,11 @@ impl PluginWindow {
     fn send_port_values(&mut self) {
         let Some(port_event) = (unsafe { (*self.desc).port_event }) else { return };
         let link = &self.ctrl.link;
+        // Plugin → GUI atom events (e.g. a drum kit's "notify" port).
+        while let Some(port) = link.next_dsp_event(&mut self.event_buf) {
+            let buf = &self.event_buf;
+            unsafe { port_event(self.handle, port, buf.len() as u32, self.ctrl.event_transfer, buf.as_ptr() as *const c_void) };
+        }
         let ins = link.control_in_ports.iter().zip(&self.shared.params);
         let outs = link.control_out_ports.iter().zip(&self.shared.outputs);
         for (port, value) in ins.chain(outs) {
@@ -412,6 +424,7 @@ impl PluginWindow {
 
 impl Drop for PluginWindow {
     fn drop(&mut self) {
+        self.ctrl.link.gui_open.store(false, std::sync::atomic::Ordering::Relaxed);
         let Ok(x) = x11() else { return };
         unsafe {
             ((*self.desc).cleanup)(self.handle);

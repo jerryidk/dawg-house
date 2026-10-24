@@ -442,3 +442,27 @@ fn waveform_editor_edits_takes_and_clips() {
     let new_len = h.state().project.track(track).unwrap().clips[0].length;
     assert_eq!(new_len, clip.length - spb as u64, "trim end by one beat");
 }
+
+/// Picking a drum kit on an instrument track replaces the built-in synth as
+/// the device that receives the notes. Skipped when avldrums is missing.
+#[test]
+fn drum_kit_replaces_the_instrument_on_instrument_tracks() {
+    let mut h = harness();
+    if h.state().registry.get("lv2:http://gareus.org/oss/lv2/avldrums#BlackPearl").is_none() {
+        return;
+    }
+    let inst = h.state().project.tracks[1].id;
+    h.state_mut().sel.track = Some(inst);
+    h.state_mut().bottom = BottomTab::Devices;
+    h.run_steps(2);
+    h.get_by_label(&format!("{} Change instrument", egui_phosphor::regular::PIANO_KEYS)).click();
+    h.run_steps(2);
+    h.get_by_label("Black Pearl Drumkit   ").click();
+    h.run_steps(2);
+    let devices: Vec<_> = h.state().project.track(inst).unwrap().devices.iter().map(|d| d.name.clone()).collect();
+    assert_eq!(devices, vec!["Black Pearl Drumkit"]);
+    // An effect still goes after the instrument.
+    h.state_mut().add_device(inst, "builtin:utility");
+    let devices: Vec<_> = h.state().project.track(inst).unwrap().devices.iter().map(|d| d.name.clone()).collect();
+    assert_eq!(devices, vec!["Black Pearl Drumkit", "Utility"]);
+}

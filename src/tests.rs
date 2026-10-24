@@ -597,3 +597,95 @@ fn loop_wraps_when_a_block_ends_exactly_on_the_loop_end() {
     // Not looping: plain advance.
     assert_eq!(loop_block(10, 256, 256, false, ls, le), (10, 256, 266));
 }
+
+/// Render `blocks` of 256 frames through an instrument, hitting `note` every
+/// 0.25 s, pacing like real time so the plugin's worker thread can run.
+fn play_drum(reg: &DeviceRegistry, id: &str, note: u8, blocks: usize) -> (f32, f32, f32) {
+    let info = reg.get(id).unwrap();
+    let mut dev = reg.create(id, 48000.0, DeviceShared::new(info), None).unwrap().device;
+    let (mut peak_l, mut peak_r, mut max_diff) = (0f32, 0f32, 0f32);
+    for b in 0..blocks {
+        let (mut l, mut r) = (vec![0.0f32; 256], vec![0.0f32; 256]);
+        let midi = if b.is_multiple_of(47) { vec![MidiEvent::new(0, &[0x99, note, 120])] } else { vec![] };
+        dev.process(&mut ProcessContext { left: &mut l, right: &mut r, midi: &midi });
+        for (a, c) in l.iter().zip(&r) {
+            peak_l = peak_l.max(a.abs());
+            peak_r = peak_r.max(c.abs());
+            max_diff = max_diff.max((a - c).abs());
+        }
+        std::thread::sleep(std::time::Duration::from_micros(5333));
+    }
+    (peak_l, peak_r, max_diff)
+}
+
+/// AVL "Black Pearl" drum kit: an LV2 instrument that loads its samples
+/// through the worker extension. Skipped when avldrums is not installed.
+#[test]
+fn avl_drumkit_plays_via_worker_and_multi_out_downmix() {
+    let reg = registry();
+    let stereo = "lv2:http://gareus.org/oss/lv2/avldrums#BlackPearl";
+    let multi = "lv2:http://gareus.org/oss/lv2/avldrums#BlackPearlMulti";
+    let Some(info) = reg.get(stereo) else {
+        println!("avldrums not installed, skipping");
+        return;
+    };
+    assert!(info.unsupported.is_none(), "{:?}", info.unsupported);
+    assert_eq!(info.category, DeviceCategory::Instrument);
+    // ~2.5 s of playback: the kit loads in the background, then kicks sound.
+    let (l, r, _) = play_drum(&reg, stereo, 36, 470);
+    println!("Black Pearl stereo: peak L {l:.3} R {r:.3}");
+    assert!(l > 0.01 && r > 0.01, "kick should sound once the kit has loaded");
+    // Multi-out: the kick is a mono (centre) output, so L and R match.
+    let (l, r, diff) = play_drum(&reg, multi, 36, 470);
+    println!("Black Pearl multi: peak L {l:.3} R {r:.3}, max L/R difference {diff:.4}");
+    assert!(l > 0.01 && r > 0.01, "multi-out kit should sound through the stereo downmix");
+    assert!(diff < 1e-6, "centre (mono) drum should be identical on both sides");
+}
+
+/// Opens the AVL drum kit's own GUI while the plugin runs and gets hits,
+/// so its notify-port events reach the GUI. Needs avldrums and a display.
+#[test]
+#[ignore]
+fn avl_drumkit_gui() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    crate::lv2ui::init_x11();
+    let reg = registry();
+    let id = "lv2:http://gareus.org/oss/lv2/avldrums#BlackPearl";
+    let info = reg.get(id).expect("avldrums not installed").clone();
+    assert!(info.has_gui);
+    let shared = DeviceShared::new(&info);
+    let created = reg.create(id, 48000.0, shared.clone(), None).unwrap();
+    let link = created.lv2.unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let mut dev = created.device;
+    let audio = std::thread::spawn(move || {
+        let mut b = 0u64;
+        while !stop2.load(Ordering::Relaxed) {
+            let (mut l, mut r) = (vec![0.0f32; 256], vec![0.0f32; 256]);
+            // Kick, snare, hi-hat pattern.
+            let note = [36u8, 42, 38, 42][(b / 47 % 4) as usize];
+            let midi = if b.is_multiple_of(47) { vec![MidiEvent::new(0, &[0x99, note, 110])] } else { vec![] };
+            dev.process(&mut ProcessContext { left: &mut l, right: &mut r, midi: &midi });
+            b += 1;
+            std::thread::sleep(Duration::from_micros(5333));
+        }
+        dev
+    });
+    let mut gui = crate::lv2ui::GuiHost::new();
+    gui.open(link, shared.clone(), "AVL drums test".into(), 48000.0);
+    let secs: u64 = std::env::var("STUDIO_GUI_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let t0 = Instant::now();
+    let mut msgs = vec![];
+    while t0.elapsed() < Duration::from_secs(secs) {
+        msgs.extend(gui.poll());
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(msgs.is_empty(), "{msgs:?}");
+    assert_eq!(gui.open_count(), 1);
+    gui.close(&shared);
+    stop.store(true, Ordering::Relaxed);
+    drop(audio.join().unwrap());
+}

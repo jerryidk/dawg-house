@@ -45,6 +45,8 @@ PipeWire / JACK server ──► ALSA (kernel drivers) ──► audio interface
 | D-Bus + `xdg-desktop-portal` (+ a GNOME, KDE or GTK backend) | `xdg-desktop-portal`, `xdg-desktop-portal-gnome` | same | same | `rfd` (pure-Rust zbus, no library) | Open, save and export file dialogs | File dialogs do not open |
 | glibc | — | — | — | the binary | C runtime | Binaries only run on glibc at least as new as the build machine's |
 
+**Plugin features Studio provides:** `urid:map/unmap`, `options`, `buf-size:boundedBlockLength`, `worker:schedule` (one worker thread per instance), `state:interface` save/restore, and for GUIs `ui:parent`, `instance-access`, `ui:idleInterface` and `ui:resize`. GUIs exchange atom messages with their plugin in both directions.
+
 **Plugins** are found in `LV2_PATH`. If it is unset, `lv2::setup_lv2_path` sets `~/.lv2:/usr/local/lib/lv2:/usr/lib/lv2:/usr/lib64/lv2:/usr/lib/<multiarch>/lv2`. Plugin GUIs bring their own dependencies; for example, x42 GUIs use OpenGL through GLX, and JUCE GUIs use X11.
 
 ## Rust crates (direct dependencies)

@@ -321,22 +321,35 @@ impl StudioApp {
             self.notify("Device chain is full");
             return;
         }
-        let index = t.devices.len();
+        // On instrument tracks only the first device receives notes, so a new
+        // instrument goes first and replaces the instrument already there.
+        let is_instrument = |id: &str| self.registry.get(id).is_some_and(|d| d.category == DeviceCategory::Instrument);
+        let new_instrument = t.kind == TrackKind::Instrument && info.category == DeviceCategory::Instrument;
+        let replaces = new_instrument && t.devices.first().is_some_and(|d| is_instrument(&d.device_id));
+        let replaced_name = t.devices.first().map(|d| d.name.clone()).unwrap_or_default();
+        let index = if new_instrument { 0 } else { t.devices.len() };
         let shared = DeviceShared::new(info);
         let name = info.name.clone();
         match self.registry.create(device_id, self.rate() as f64, shared.clone(), None) {
             Ok(created) => {
+                if replaces {
+                    self.remove_device(track, 0);
+                    self.notify(format!("Replaced {replaced_name} with {name}"));
+                }
                 self.engine.send(Command::InsertDevice { track, index, device: created.device });
                 if let Some(t) = self.project.track_mut(track) {
-                    t.devices.push(DeviceSlot {
-                        device_id: device_id.into(),
-                        name,
-                        params: vec![],
-                        bypass: false,
-                        shared: Some(shared),
-                        state: None,
-                        lv2: created.lv2,
-                    });
+                    t.devices.insert(
+                        index,
+                        DeviceSlot {
+                            device_id: device_id.into(),
+                            name,
+                            params: vec![],
+                            bypass: false,
+                            shared: Some(shared),
+                            state: None,
+                            lv2: created.lv2,
+                        },
+                    );
                 }
             }
             Err(e) => self.notify(e),
@@ -1548,10 +1561,21 @@ impl StudioApp {
                 }
                 let label = if kind == TrackKind::Instrument && n == 0 { "Add instrument" } else { "Add device" };
                 let add = egui::Button::new(RichText::new(format!("{} {label}", icon::PLUS)).size(14.0)).min_size(egui::vec2(140.0, 60.0));
-                if ui.add(add).clicked() {
-                    let category = if kind == TrackKind::Instrument && n == 0 { Some(DeviceCategory::Instrument) } else { None };
-                    self.browser = Some(Browser { track: tid, filter: String::new(), category });
-                }
+                ui.vertical(|ui| {
+                    if ui.add(add).clicked() {
+                        let category = if kind == TrackKind::Instrument && n == 0 { Some(DeviceCategory::Instrument) } else { None };
+                        self.browser = Some(Browser { track: tid, filter: String::new(), category });
+                    }
+                    if kind == TrackKind::Instrument
+                        && n > 0
+                        && ui
+                            .add(egui::Button::new(format!("{} Change instrument", icon::PIANO_KEYS)).min_size(egui::vec2(140.0, 28.0)))
+                            .on_hover_text("Pick an instrument (synth, drum kit, …) to replace the one receiving the notes")
+                            .clicked()
+                    {
+                        self.browser = Some(Browser { track: tid, filter: String::new(), category: Some(DeviceCategory::Instrument) });
+                    }
+                });
             });
         });
         match action {

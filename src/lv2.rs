@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub const MAX_BLOCK: usize = 8192;
@@ -129,6 +129,7 @@ lilv_api! {
     port_get_symbol: fn(P, P) -> P;
     port_get_scale_points: fn(P, P) -> P;
     port_supports_event: fn(P, P, P) -> bool;
+    port_get: fn(P, P, P) -> P;
     scale_points_begin: fn(P) -> P;
     scale_points_is_end: fn(P, P) -> bool;
     scale_points_next: fn(P, P) -> P;
@@ -212,6 +213,7 @@ const SUPPORTED_FEATURES: &[&str] = &[
     "http://lv2plug.in/ns/lv2core#isLive",
     "http://lv2plug.in/ns/lv2core#hardRTCapable",
     "http://lv2plug.in/ns/lv2core#inPlaceBroken",
+    "http://lv2plug.in/ns/ext/worker#schedule",
 ];
 
 // ---------------------------------------------------------------------------
@@ -226,11 +228,20 @@ enum PortKind {
     Other,
 }
 
+/// Which stereo side an audio port belongs to (from `lv2:designation`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    Center,
+    Left,
+    Right,
+}
+
 #[derive(Clone, Debug)]
 struct PortInfo {
     index: u32,
     kind: PortKind,
     is_input: bool,
+    side: Side,
     /// Atom input that accepts MIDI events.
     midi: bool,
     param: ParamInfo,
@@ -259,6 +270,10 @@ impl PluginInfo {
     /// LV2 port indices of the control inputs, in parameter order.
     pub fn control_in_ports(&self) -> Vec<u32> {
         self.ports.iter().filter(|p| p.kind == PortKind::Control && p.is_input).map(|p| p.index).collect()
+    }
+    /// Stereo side of each audio output, in output order.
+    fn out_sides(&self) -> Vec<Side> {
+        self.ports.iter().filter(|p| p.kind == PortKind::Audio && !p.is_input).map(|p| p.side).collect()
     }
     /// LV2 port indices of the control outputs, in output order.
     pub fn control_out_ports(&self) -> Vec<u32> {
@@ -327,6 +342,7 @@ impl Lv2Host {
             let n_log = uri("http://lv2plug.in/ns/ext/port-props#logarithmic");
             let n_midi = uri("http://lv2plug.in/ns/ext/midi#MidiEvent");
             let n_x11ui = uri("http://lv2plug.in/ns/extensions/ui#X11UI");
+            let n_designation = core("designation");
 
             let mut plugins = Vec::new();
             let all = (api.world_get_all_plugins)(world);
@@ -413,10 +429,27 @@ impl Lv2Host {
                     }
 
                     let is_input = is(n_input);
+                    let side = if kind == PortKind::Audio {
+                        let d = (api.port_get)(plugin, port, n_designation);
+                        let name = node_str(d);
+                        if !d.is_null() {
+                            (api.node_free)(d);
+                        }
+                        if name.ends_with("#left") {
+                            Side::Left
+                        } else if name.ends_with("#right") {
+                            Side::Right
+                        } else {
+                            Side::Center
+                        }
+                    } else {
+                        Side::Center
+                    };
                     ports.push(PortInfo {
                         index: idx as u32,
                         kind,
                         is_input,
+                        side,
                         midi: kind == PortKind::Atom && is_input && (api.port_supports_event)(plugin, port, n_midi),
                         param: ParamInfo {
                             symbol,
@@ -475,7 +508,7 @@ impl Lv2Host {
                 };
                 plugins.push(PluginInfo { info, uri: uri_s, ui, ports, audio_in, audio_out, plugin });
             }
-            for n in [n_input, n_audio, n_control, n_cv, n_atom, n_toggled, n_integer, n_enum, n_srate, n_log, n_midi, n_x11ui] {
+            for n in [n_input, n_audio, n_control, n_cv, n_atom, n_toggled, n_integer, n_enum, n_srate, n_log, n_midi, n_x11ui, n_designation] {
                 (api.node_free)(n);
             }
             plugins.sort_by_key(|p| p.info.name.to_lowercase());
@@ -502,19 +535,25 @@ impl Lv2Host {
         if let Some(r) = &info.info.unsupported {
             return Err(format!("{}: {r}", info.info.name));
         }
-        let features = FeatureSet::new(sample_rate as f32);
         let copies = if info.audio_in == 1 && info.audio_out == 1 { 2 } else { 1 };
         let mut insts = Vec::new();
         for _ in 0..copies {
+            // Each instance gets its own worker (and so its own feature array).
+            let worker = Worker::new();
+            let features = FeatureSet::new(sample_rate as f32, Some(unsafe { &mut (*worker).schedule as *mut WorkerSchedule }));
             let raw = unsafe { (api.plugin_instantiate)(info.plugin, sample_rate, features.ptrs.as_ptr()) };
             if raw.is_null() {
+                unsafe { drop(Box::from_raw(worker)) };
                 return Err(format!("{}: instantiation failed", info.info.name));
             }
-            insts.push(unsafe { Inst::new(raw, info) });
+            let mut inst = unsafe { Inst::new(raw, info, features) };
+            unsafe { (*worker).start(inst.handle, inst.desc) };
+            inst.worker = worker;
+            insts.push(inst);
         }
         if let Some(entries) = state {
             for inst in &insts {
-                unsafe { restore_state(inst.desc, inst.handle, entries, &features) };
+                unsafe { restore_state(inst.desc, inst.handle, entries, &inst.features) };
             }
         }
         for inst in &insts {
@@ -523,6 +562,8 @@ impl Lv2Host {
             }
         }
         let (ui_tx, ui_rx) = rtrb::RingBuffer::new(UI_QUEUE_BYTES);
+        let (dsp_tx, dsp_rx) = rtrb::RingBuffer::new(UI_QUEUE_BYTES);
+        let gui_open = Arc::new(AtomicBool::new(false));
         let link = Arc::new(Lv2Link {
             plugin_uri: info.uri.clone(),
             ui: info.ui.clone(),
@@ -531,6 +572,8 @@ impl Lv2Host {
             control_in_ports: info.control_in_ports(),
             control_out_ports: info.control_out_ports(),
             ui_tx: Mutex::new(ui_tx),
+            dsp_rx: Mutex::new(dsp_rx),
+            gui_open: gui_open.clone(),
         });
         let runtime = PluginRuntime {
             insts,
@@ -539,8 +582,10 @@ impl Lv2Host {
             midi_urid: urid("http://lv2plug.in/ns/ext/midi#MidiEvent"),
             chunk_urid: urid("http://lv2plug.in/ns/ext/atom#Chunk"),
             ui_rx,
+            dsp_tx,
+            gui_open,
+            out_sides: info.out_sides(),
             scratch: vec![0u8; ATOM_BUF_BYTES].into_boxed_slice(),
-            _features: features,
         };
         Ok((runtime, link))
     }
@@ -563,9 +608,41 @@ pub struct Lv2Link {
     pub control_out_ports: Vec<u32>,
     /// GUI → audio thread messages: [port u32][size u32][LV2_Atom bytes].
     ui_tx: Mutex<rtrb::Producer<u8>>,
+    /// Audio thread → GUI: events from the plugin's atom outputs, same framing.
+    dsp_rx: Mutex<rtrb::Consumer<u8>>,
+    /// Set while a GUI is open; the audio thread only forwards events then.
+    pub gui_open: Arc<AtomicBool>,
 }
 
 impl Lv2Link {
+    /// Take the next plugin → GUI event: (atom output port, LV2_Atom bytes).
+    pub fn next_dsp_event(&self, buf: &mut Vec<u8>) -> Option<u32> {
+        let mut rx = self.dsp_rx.lock().ok()?;
+        let avail = rx.slots();
+        if avail < 8 {
+            return None;
+        }
+        let mut h = [0u8; 8];
+        {
+            let head = rx.read_chunk(8).ok()?;
+            let (a, b) = head.as_slices();
+            for (d, s) in h.iter_mut().zip(a.iter().chain(b)) {
+                *d = *s;
+            }
+        }
+        let port = u32::from_ne_bytes(h[0..4].try_into().unwrap());
+        let len = u32::from_ne_bytes(h[4..8].try_into().unwrap()) as usize;
+        if avail < 8 + len {
+            return None;
+        }
+        let chunk = rx.read_chunk(8 + len).ok()?;
+        let (a, b) = chunk.as_slices();
+        buf.clear();
+        buf.extend(a.iter().chain(b).skip(8));
+        chunk.commit_all();
+        Some(port)
+    }
+
     /// Queue an atom (header + body, as given by a GUI's write function) for
     /// the plugin's atom input `port`.
     pub fn send_atom(&self, port: u32, atom: &[u8]) -> bool {
@@ -667,7 +744,7 @@ const STATE_FLAGS: u32 = 1 | 2;
 pub fn save_state(link: &Lv2Link) -> Option<Vec<StateEntry>> {
     let desc = link.desc as *const Lv2Descriptor;
     let iface = unsafe { state_interface(desc) }?;
-    let features = FeatureSet::new(48000.0);
+    let features = FeatureSet::new(48000.0, None);
     let mut out: Vec<StateEntry> = vec![];
     unsafe { (iface.save)(link.handle as P, store_cb, &mut out as *mut _ as P, STATE_FLAGS, features.ptrs.as_ptr()) };
     Some(out)
@@ -692,7 +769,7 @@ struct FeatureSet {
 }
 
 impl FeatureSet {
-    fn new(rate: f32) -> Box<Self> {
+    fn new(rate: f32, schedule: Option<*mut WorkerSchedule>) -> Box<Self> {
         let mut map = Box::new(UridMapFeature { handle: std::ptr::null_mut(), map: urid_map_cb });
         let mut unmap = Box::new(UridUnmapFeature { handle: std::ptr::null_mut(), unmap: urid_unmap_cb });
         let ints = Box::new([1i32, MAX_BLOCK as i32, 1024]);
@@ -720,6 +797,10 @@ impl FeatureSet {
             Lv2Feature { uri: URI_OPTIONS.as_ptr(), data: options.as_mut_ptr() as P },
             Lv2Feature { uri: URI_BOUNDED.as_ptr(), data: std::ptr::null_mut() },
         ];
+        let mut features = features;
+        if let Some(sched) = schedule {
+            features.push(Lv2Feature { uri: URI_WORKER_SCHEDULE.as_ptr(), data: sched as P });
+        }
         let mut ptrs: Vec<*const Lv2Feature> = features.iter().map(|f| f as *const _).collect();
         ptrs.push(std::ptr::null());
         Box::new(FeatureSet {
@@ -749,13 +830,18 @@ struct Inst {
     /// LV2 port index of each `atom_in` buffer.
     atom_in_ports: Vec<u32>,
     atom_out: Vec<Box<[u64]>>,
+    /// LV2 port index of each `atom_out` buffer.
+    atom_out_ports: Vec<u32>,
     /// Index into `atom_in` of the port receiving MIDI.
     midi_in: Option<usize>,
     _cv: Vec<Box<[f32]>>,
+    /// Worker for `work:schedule` (owned; freed after the thread stopped).
+    worker: *mut Worker,
+    features: Box<FeatureSet>,
 }
 
 impl Inst {
-    unsafe fn new(raw: *mut LilvInstance, info: &PluginInfo) -> Self {
+    unsafe fn new(raw: *mut LilvInstance, info: &PluginInfo, features: Box<FeatureSet>) -> Self {
         let (desc, handle) = unsafe { ((*raw).descriptor, (*raw).handle) };
         let mut inst = Inst {
             raw,
@@ -768,8 +854,11 @@ impl Inst {
             atom_in: vec![],
             atom_in_ports: vec![],
             atom_out: vec![],
+            atom_out_ports: vec![],
             midi_in: None,
             _cv: vec![],
+            worker: std::ptr::null_mut(),
+            features,
         };
         let connect = unsafe { (*desc).connect_port };
         let (mut ci, mut co) = (0, 0);
@@ -792,7 +881,10 @@ impl Inst {
                     inst.atom_in_ports.push(p.index);
                     push_buf(&mut inst.atom_in, vec![0u64; ATOM_BUF_BYTES / 8])
                 }
-                (PortKind::Atom, false) => push_buf(&mut inst.atom_out, vec![0u64; ATOM_BUF_BYTES / 8]),
+                (PortKind::Atom, false) => {
+                    inst.atom_out_ports.push(p.index);
+                    push_buf(&mut inst.atom_out, vec![0u64; ATOM_BUF_BYTES / 8])
+                }
                 _ => push_buf(&mut inst._cv, vec![0f32; MAX_BLOCK]),
             };
             unsafe { connect(handle, p.index, ptr) };
@@ -858,12 +950,49 @@ pub struct PluginRuntime {
     midi_urid: u32,
     chunk_urid: u32,
     ui_rx: rtrb::Consumer<u8>,
+    dsp_tx: rtrb::Producer<u8>,
+    gui_open: Arc<AtomicBool>,
+    /// Stereo side of each audio output (used to downmix multi-out plugins).
+    out_sides: Vec<Side>,
     /// Preallocated buffer for GUI messages (no allocation on the audio thread).
     scratch: Box<[u8]>,
-    _features: Box<FeatureSet>,
 }
 
 impl PluginRuntime {
+    /// Forward events from the first instance's atom outputs to an open GUI.
+    fn forward_atom_outputs(&mut self) {
+        if !self.gui_open.load(Ordering::Relaxed) {
+            return;
+        }
+        let inst = &self.insts[0];
+        for (buf, &port) in inst.atom_out.iter().zip(&inst.atom_out_ports) {
+            let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 8) };
+            let size = u32::from_ne_bytes(bytes[0..4].try_into().unwrap()) as usize;
+            let type_ = u32::from_ne_bytes(bytes[4..8].try_into().unwrap());
+            if type_ != self.seq_urid {
+                continue; // the plugin wrote nothing this cycle
+            }
+            let end = (8 + size).min(bytes.len());
+            let mut at = 16; // atom header + sequence body
+            while at + 16 <= end {
+                let asize = u32::from_ne_bytes(bytes[at + 8..at + 12].try_into().unwrap()) as usize;
+                let atom = &bytes[at + 8..(at + 16 + asize).min(end)];
+                let need = 8 + atom.len();
+                if self.dsp_tx.slots() >= need
+                    && let Ok(mut chunk) = self.dsp_tx.write_chunk_uninit(need)
+                {
+                    let msg = port.to_ne_bytes().into_iter().chain((atom.len() as u32).to_ne_bytes()).chain(atom.iter().copied());
+                    let (a, b) = chunk.as_mut_slices();
+                    for (dst, v) in a.iter_mut().chain(b.iter_mut()).zip(msg) {
+                        dst.write(v);
+                    }
+                    unsafe { chunk.commit_all() };
+                }
+                at += 16 + asize.div_ceil(8) * 8;
+            }
+        }
+    }
+
     /// Deliver queued GUI messages to the first instance's atom inputs.
     fn deliver_ui_messages(&mut self) {
         let inst = &mut self.insts[0];
@@ -941,10 +1070,31 @@ impl Device for PluginRuntime {
                 buf[..n].copy_from_slice(&src[..n]);
             }
             unsafe { ((*inst.desc).run)(inst.handle, n as u32) };
+            if !inst.worker.is_null() {
+                unsafe { (*inst.worker).deliver_responses(inst.handle) };
+            }
         }
+        self.forward_atom_outputs();
         if dual {
             l[..n].copy_from_slice(&self.insts[0].audio_out[0][..n]);
             r[..n].copy_from_slice(&self.insts[1].audio_out[0][..n]);
+        } else if self.out_sides.len() > 2 {
+            // Multi-output plugin (e.g. a drum kit with one output per drum):
+            // left/right-designated outputs go to their side, others to both.
+            l[..n].fill(0.0);
+            r[..n].fill(0.0);
+            for (out, side) in self.insts[0].audio_out.iter().zip(&self.out_sides) {
+                for i in 0..n {
+                    match side {
+                        Side::Left => l[i] += out[i],
+                        Side::Right => r[i] += out[i],
+                        Side::Center => {
+                            l[i] += out[i];
+                            r[i] += out[i];
+                        }
+                    }
+                }
+            }
         } else {
             let outs = &self.insts[0].audio_out;
             l[..n].copy_from_slice(&outs[0][..n]);
@@ -960,13 +1110,197 @@ impl Device for PluginRuntime {
 impl Drop for PluginRuntime {
     fn drop(&mut self) {
         let Ok(api) = api() else { return };
-        for inst in &self.insts {
+        for inst in &mut self.insts {
             unsafe {
+                // Stop the worker thread before the instance goes away.
+                if !inst.worker.is_null() {
+                    drop(Box::from_raw(inst.worker));
+                    inst.worker = std::ptr::null_mut();
+                }
                 if let Some(deactivate) = (*inst.desc).deactivate {
                     deactivate(inst.handle);
                 }
                 (api.instance_free)(inst.raw);
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Worker extension (work:schedule / work:interface)
+//
+// Plugins such as sample players load files off the audio thread: `run()`
+// schedules work, a worker thread executes it, and the response is handed
+// back to the plugin on the audio thread after the next `run()`. Both
+// directions use lock-free queues framed as [u32 size][bytes].
+
+const URI_WORKER_SCHEDULE: &CStr = c"http://lv2plug.in/ns/ext/worker#schedule";
+const URI_WORKER_INTERFACE: &CStr = c"http://lv2plug.in/ns/ext/worker#interface";
+const WORKER_QUEUE_BYTES: usize = 256 * 1024;
+/// LV2_WORKER_SUCCESS / LV2_WORKER_ERR_NO_SPACE
+const WORK_OK: u32 = 0;
+const WORK_NO_SPACE: u32 = 2;
+
+type RespondFn = unsafe extern "C" fn(P, u32, *const c_void) -> u32;
+
+#[repr(C)]
+pub(crate) struct WorkerSchedule {
+    handle: P,
+    schedule_work: unsafe extern "C" fn(P, u32, *const c_void) -> u32,
+}
+
+#[repr(C)]
+struct WorkerInterface {
+    work: unsafe extern "C" fn(P, RespondFn, P, u32, *const c_void) -> u32,
+    work_response: unsafe extern "C" fn(P, u32, *const c_void) -> u32,
+    end_run: Option<unsafe extern "C" fn(P) -> u32>,
+}
+
+fn push_msg(tx: &mut rtrb::Producer<u8>, data: &[u8]) -> bool {
+    let need = 4 + data.len();
+    if tx.slots() < need {
+        return false;
+    }
+    let Ok(mut chunk) = tx.write_chunk_uninit(need) else { return false };
+    let msg = (data.len() as u32).to_ne_bytes().into_iter().chain(data.iter().copied());
+    let (a, b) = chunk.as_mut_slices();
+    for (dst, v) in a.iter_mut().chain(b.iter_mut()).zip(msg) {
+        dst.write(v);
+    }
+    unsafe { chunk.commit_all() };
+    true
+}
+
+/// Pop one message into `out`; returns its length.
+fn pop_msg(rx: &mut rtrb::Consumer<u8>, out: &mut [u8]) -> Option<usize> {
+    let avail = rx.slots();
+    if avail < 4 {
+        return None;
+    }
+    let mut h = [0u8; 4];
+    {
+        let head = rx.read_chunk(4).ok()?;
+        let (a, b) = head.as_slices();
+        for (d, s) in h.iter_mut().zip(a.iter().chain(b)) {
+            *d = *s;
+        }
+    }
+    let len = u32::from_ne_bytes(h) as usize;
+    if avail < 4 + len {
+        return None;
+    }
+    let chunk = rx.read_chunk(4 + len).ok()?;
+    let (a, b) = chunk.as_slices();
+    let n = len.min(out.len());
+    for (d, s) in out[..n].iter_mut().zip(a.iter().chain(b).skip(4)) {
+        *d = *s;
+    }
+    chunk.commit_all();
+    Some(n)
+}
+
+unsafe extern "C" fn schedule_work_cb(handle: P, size: u32, data: *const c_void) -> u32 {
+    let Some(w) = (unsafe { (handle as *mut Worker).as_mut() }) else { return WORK_NO_SPACE };
+    let bytes = if data.is_null() { &[][..] } else { unsafe { std::slice::from_raw_parts(data as *const u8, size as usize) } };
+    if push_msg(&mut w.requests, bytes) { WORK_OK } else { WORK_NO_SPACE }
+}
+
+unsafe extern "C" fn respond_cb(handle: P, size: u32, data: *const c_void) -> u32 {
+    let Some(tx) = (unsafe { (handle as *mut rtrb::Producer<u8>).as_mut() }) else { return WORK_NO_SPACE };
+    let bytes = if data.is_null() { &[][..] } else { unsafe { std::slice::from_raw_parts(data as *const u8, size as usize) } };
+    if push_msg(tx, bytes) { WORK_OK } else { WORK_NO_SPACE }
+}
+
+pub(crate) struct Worker {
+    schedule: WorkerSchedule,
+    /// Audio thread → worker thread.
+    requests: rtrb::Producer<u8>,
+    /// Worker thread → audio thread.
+    responses: rtrb::Consumer<u8>,
+    /// Queue ends handed to the thread when it starts.
+    thread_ends: Option<(rtrb::Consumer<u8>, rtrb::Producer<u8>)>,
+    iface: *const WorkerInterface,
+    scratch: Box<[u8]>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+struct SendPtr(usize, usize);
+unsafe impl Send for SendPtr {}
+
+impl Worker {
+    /// Allocate a worker; the schedule feature points into it, so it lives
+    /// at a fixed address until the owning instance is freed.
+    fn new() -> *mut Worker {
+        let (requests, req_rx) = rtrb::RingBuffer::new(WORKER_QUEUE_BYTES);
+        let (resp_tx, responses) = rtrb::RingBuffer::new(WORKER_QUEUE_BYTES);
+        let w = Box::into_raw(Box::new(Worker {
+            schedule: WorkerSchedule { handle: std::ptr::null_mut(), schedule_work: schedule_work_cb },
+            requests,
+            responses,
+            thread_ends: Some((req_rx, resp_tx)),
+            iface: std::ptr::null(),
+            scratch: vec![0u8; WORKER_QUEUE_BYTES].into_boxed_slice(),
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        }));
+        unsafe { (*w).schedule.handle = w as P };
+        w
+    }
+
+    /// Start the worker thread if the plugin implements `work:interface`.
+    unsafe fn start(&mut self, handle: P, desc: *const Lv2Descriptor) {
+        unsafe {
+            if (*desc).extension_data.is_null() {
+                return;
+            }
+            let ext: unsafe extern "C" fn(*const c_char) -> *const c_void = std::mem::transmute((*desc).extension_data);
+            self.iface = ext(URI_WORKER_INTERFACE.as_ptr()) as *const WorkerInterface;
+        }
+        if self.iface.is_null() {
+            return;
+        }
+        let Some((mut rx, tx)) = self.thread_ends.take() else { return };
+        let stop = self.stop.clone();
+        let ptrs = SendPtr(handle as usize, self.iface as usize);
+        self.thread = std::thread::Builder::new()
+            .name("studio-lv2-worker".into())
+            .spawn(move || {
+                let ptrs = ptrs;
+                let (handle, iface) = (ptrs.0 as P, ptrs.1 as *const WorkerInterface);
+                let mut tx = Box::new(tx);
+                let mut buf = vec![0u8; WORKER_QUEUE_BYTES];
+                while !stop.load(Ordering::Relaxed) {
+                    match pop_msg(&mut rx, &mut buf) {
+                        Some(n) => unsafe {
+                            ((*iface).work)(handle, respond_cb, &mut *tx as *mut rtrb::Producer<u8> as P, n as u32, buf.as_ptr() as *const c_void);
+                        },
+                        None => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    }
+                }
+            })
+            .ok();
+    }
+
+    /// Hand finished work back to the plugin (audio thread, after `run`).
+    unsafe fn deliver_responses(&mut self, handle: P) {
+        if self.iface.is_null() {
+            return;
+        }
+        while let Some(n) = pop_msg(&mut self.responses, &mut self.scratch) {
+            unsafe { ((*self.iface).work_response)(handle, n as u32, self.scratch.as_ptr() as *const c_void) };
+        }
+        if let Some(end_run) = unsafe { (*self.iface).end_run } {
+            unsafe { end_run(handle) };
+        }
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
         }
     }
 }

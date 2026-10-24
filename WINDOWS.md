@@ -1,6 +1,6 @@
 # Studio on Windows
 
-Status: **working port** on the `windows-port` branch. The Windows build compiles, links, and passes the test suite under Wine. Under Wine, audio plays through WASAPI and audio input works. It has not yet been run on real Windows 11 hardware.
+Status: **working port**, released as an NSIS installer (`scripts/release.sh`). The Windows build compiles, links, and passes the test suite under Wine. Under Wine, audio plays through WASAPI and audio input works. It has not yet been run on real Windows 11 hardware.
 
 ## Audio driver: decisions
 
@@ -62,4 +62,4 @@ WINEDEBUG=-all wine target/x86_64-pc-windows-gnu/debug/studio.exe
 * WASAPI exclusive mode (waiting for cpal 0.19).
 * Choosing the input device separately from the output under WASAPI (it uses the default capture device).
 * CLAP/VST3 plugin hosting and native plugin GUIs.
-* An installer (Studio ships as a single `.exe` for now) and code signing.
+* Code signing (the installer and `studio.exe` are unsigned, so SmartScreen will warn).

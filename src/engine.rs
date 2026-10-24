@@ -284,6 +284,28 @@ fn push_event(events: &mut Vec<MidiEvent>, e: MidiEvent) {
     }
 }
 
+/// Loop arithmetic for one block of `n` frames (`total` = full cycle size).
+/// Returns (play position, split, next position): frames `[0, split)` play
+/// from the returned position and frames `[split, n)` from `ls`.
+///
+/// A position at or past the loop end wraps first. This covers a block that
+/// ended exactly on the loop end (loop length a multiple of the block size,
+/// e.g. whole bars at 120 BPM / 48 kHz) and a loop that was shortened.
+/// Positions before the loop start (count-in) play on until they reach it.
+pub(crate) fn loop_block(pos: i64, n: usize, total: usize, looping: bool, ls: i64, le: i64) -> (i64, usize, i64) {
+    if !looping || le <= ls {
+        return (pos, n, pos + total as i64);
+    }
+    let len = le - ls;
+    let pos = if pos >= le { ls + (pos - ls).rem_euclid(len) } else { pos };
+    let split = if pos + n as i64 > le { (le - pos) as usize } else { n };
+    let mut next = if split < n { ls + (total - split) as i64 } else { pos + total as i64 };
+    if next >= le {
+        next = ls + (next - ls).rem_euclid(len);
+    }
+    (pos, split, next)
+}
+
 /// Run a track's device chain in place. On instrument tracks only the first
 /// device (the instrument) receives the notes. Shared with offline export.
 pub(crate) fn run_chain(devices: &mut [Box<dyn Device>], kind: TrackKind, l: &mut [f32], r: &mut [f32], midi: &[MidiEvent]) {
@@ -372,15 +394,13 @@ impl jack::ProcessHandler for Processor {
         let n = total.min(MAX_BLOCK);
         let playing = shared.playing.load(Ordering::Relaxed);
         let recording = shared.recording.load(Ordering::Relaxed);
-        let pos = shared.position.load(Ordering::Relaxed);
+        let pos0 = shared.position.load(Ordering::Relaxed);
         let any_solo = self.tracks.iter().any(|t| t.shared.solo.load(Ordering::Relaxed));
 
-        // Loop: at most one wrap per block (loops are much longer than blocks).
-        // Frames [0, split) play at `pos`, frames [split, n) at `loop_start`.
+        // Loop: frames [0, split) play at `pos`, frames [split, n) at `loop_start`.
         let (ls, le) = (shared.loop_start.load(Ordering::Relaxed), shared.loop_end.load(Ordering::Relaxed));
-        let looping = playing && shared.loop_enabled.load(Ordering::Relaxed) && le > ls && pos < le;
-        let split = if looping && pos + n as i64 > le { (le - pos).max(0) as usize } else { n };
-        let next_pos = if split < n { ls + (total - split) as i64 } else { pos + total as i64 };
+        let looping = playing && shared.loop_enabled.load(Ordering::Relaxed);
+        let (pos, split, next_pos) = loop_block(pos0, n, total, looping, ls, le);
         // First frame that is captured (frames before `record_from` are count-in).
         let first_rec = if !recording || pos >= self.record_from || split < n {
             0
@@ -525,7 +545,7 @@ impl jack::ProcessHandler for Processor {
         }
         if playing {
             // Only advance if nobody relocated us during this cycle.
-            let _ = shared.position.compare_exchange(pos, next_pos, Ordering::Relaxed, Ordering::Relaxed);
+            let _ = shared.position.compare_exchange(pos0, next_pos, Ordering::Relaxed, Ordering::Relaxed);
         }
         Control::Continue
     }

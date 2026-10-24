@@ -322,8 +322,10 @@ fn engine_loop_records_with_count_in() {
     let rate = engine.sample_rate as i64;
     let audio = Arc::new(TrackShared::default());
     engine.add_track(7, TrackKind::Audio, audio).unwrap();
-    // Loop of 0.25 s with a 0.25 s count-in.
-    let period = rate / 4;
+    // Loop length a multiple of the block size (like whole bars at 120 BPM),
+    // the case that used to stop after one pass, with a one-loop count-in.
+    let block = engine.buffer_size().max(1) as i64;
+    let period = (rate / 4 / block) * block;
     let sh = engine.shared.clone();
     sh.loop_enabled.store(true, Ordering::Relaxed);
     sh.loop_start.store(0, Ordering::Relaxed);
@@ -567,4 +569,31 @@ fn clips_and_takes_edit_through_one_region_interface() {
     assert!(clips.iter().all(|c| (c.gain - 0.25).abs() < 1e-6));
     assert_eq!((clips[0].fade_in, clips[1].fade_in), (100, 100));
     assert!(matches!(&clips[1].content, PlayContent::Audio { offset, .. } if *offset == 192000));
+}
+
+#[test]
+fn loop_wraps_when_a_block_ends_exactly_on_the_loop_end() {
+    use crate::engine::loop_block;
+    // 4 bars at 120 BPM / 48 kHz = 384000 frames = 1500 blocks of 256.
+    let (ls, le) = (0, 384_000);
+    let mut pos = 0i64;
+    let mut wraps = 0;
+    for _ in 0..1500 * 3 {
+        let (p, split, next) = loop_block(pos, 256, 256, true, ls, le);
+        assert!((0..le).contains(&p), "played outside the loop at {p}");
+        assert_eq!(split, 256, "blocks align with the loop, no split needed");
+        if next < pos {
+            wraps += 1;
+        }
+        pos = next;
+    }
+    assert_eq!(wraps, 3, "loop must keep wrapping, not stop after one pass");
+    // A block crossing the end splits there.
+    assert_eq!(loop_block(383_900, 256, 256, true, ls, le), (383_900, 100, 156));
+    // Count-in (before the loop start) plays on until the loop starts.
+    assert_eq!(loop_block(-512, 256, 256, true, ls, le), (-512, 256, -256));
+    // A position beyond a shortened loop wraps back inside it.
+    assert_eq!(loop_block(500_000, 256, 256, true, ls, le).0, 500_000 - 384_000);
+    // Not looping: plain advance.
+    assert_eq!(loop_block(10, 256, 256, false, ls, le), (10, 256, 266));
 }

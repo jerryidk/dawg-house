@@ -10,6 +10,7 @@
 //! to save the plugin's internal state.
 
 use crate::device::{Device, DeviceCategory, DeviceInfo, DeviceShared, ParamInfo, ProcessContext};
+use crate::{atom, frames};
 use libloading::Library;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -624,47 +625,19 @@ impl Lv2Link {
     /// Take the next plugin → GUI event: (atom output port, LV2_Atom bytes).
     pub fn next_dsp_event(&self, buf: &mut Vec<u8>) -> Option<u32> {
         let mut rx = self.dsp_rx.lock().ok()?;
-        let avail = rx.slots();
-        if avail < 8 {
-            return None;
-        }
-        let mut h = [0u8; 8];
-        {
-            let head = rx.read_chunk(8).ok()?;
-            let (a, b) = head.as_slices();
-            for (d, s) in h.iter_mut().zip(a.iter().chain(b)) {
-                *d = *s;
-            }
-        }
-        let port = u32::from_ne_bytes(h[0..4].try_into().unwrap());
-        let len = u32::from_ne_bytes(h[4..8].try_into().unwrap()) as usize;
-        if avail < 8 + len {
-            return None;
-        }
-        let chunk = rx.read_chunk(8 + len).ok()?;
-        let (a, b) = chunk.as_slices();
-        buf.clear();
-        buf.extend(a.iter().chain(b).skip(8));
-        chunk.commit_all();
-        Some(port)
+        frames::pop_with::<8, _>(&mut rx, |h, a, b| {
+            buf.clear();
+            buf.extend_from_slice(a);
+            buf.extend_from_slice(b);
+            u32::from_ne_bytes([h[0], h[1], h[2], h[3]])
+        })
     }
 
     /// Queue an atom (header + body, as given by a GUI's write function) for
     /// the plugin's atom input `port`.
     pub fn send_atom(&self, port: u32, atom: &[u8]) -> bool {
         let Ok(mut tx) = self.ui_tx.lock() else { return false };
-        let need = 8 + atom.len();
-        if atom.len() < 8 || tx.slots() < need {
-            return false;
-        }
-        let Ok(mut chunk) = tx.write_chunk_uninit(need) else { return false };
-        let msg = port.to_ne_bytes().into_iter().chain((atom.len() as u32).to_ne_bytes()).chain(atom.iter().copied());
-        let (a, b) = chunk.as_mut_slices();
-        for (dst, v) in a.iter_mut().chain(b.iter_mut()).zip(msg) {
-            dst.write(v);
-        }
-        unsafe { chunk.commit_all() };
-        true
+        atom.len() >= 8 && frames::push(&mut tx, &port_header(port, atom.len()), atom)
     }
 }
 
@@ -723,7 +696,7 @@ unsafe extern "C" fn store_cb(handle: P, key: u32, value: *const c_void, size: u
     0
 }
 
-unsafe extern "C" fn retrieve_cb(handle: P, key: u32, size: *mut usize, type_: *mut u32, flags: *mut u32) -> *const c_void {
+pub(crate) unsafe extern "C" fn retrieve_cb(handle: P, key: u32, size: *mut usize, type_: *mut u32, flags: *mut u32) -> *const c_void {
     let entries = unsafe { &*(handle as *const Vec<(u32, u32, u32, &[u8])>) };
     match entries.iter().find(|e| e.0 == key) {
         Some(&(_, t, f, v)) => unsafe {
@@ -902,33 +875,17 @@ impl Inst {
     /// their capacity, as required by the LV2 atom spec.
     fn prepare_atoms(&mut self, seq: u32, chunk: u32) {
         for b in &mut self.atom_in {
-            // LV2_Atom { size = sizeof(LV2_Atom_Sequence_Body), type = Sequence }, body { unit, pad }
-            b[0] = (8u64) | ((seq as u64) << 32);
-            b[1] = 0;
+            atom::seq_reset(atom::as_bytes_mut(b), seq);
         }
         for b in &mut self.atom_out {
-            b[0] = ((ATOM_BUF_BYTES - 8) as u64) | ((chunk as u64) << 32);
+            atom::chunk_reset(atom::as_bytes_mut(b), chunk);
         }
     }
 
     /// Append one event to atom input `buf` (after `prepare_atoms`).
     /// Returns false when the sequence is full.
     fn append_event(&mut self, buf: usize, frame: i64, type_: u32, body: &[u8]) -> bool {
-        let b = &mut self.atom_in[buf];
-        let bytes: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(b.as_mut_ptr() as *mut u8, b.len() * 8) };
-        // The sequence atom's size counts its body; events start 8-aligned after it.
-        let size = u32::from_ne_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let at = 8 + size;
-        let total = 16 + body.len().div_ceil(8) * 8;
-        if at + total > bytes.len() {
-            return false;
-        }
-        bytes[at..at + 8].copy_from_slice(&frame.to_ne_bytes());
-        bytes[at + 8..at + 12].copy_from_slice(&(body.len() as u32).to_ne_bytes());
-        bytes[at + 12..at + 16].copy_from_slice(&type_.to_ne_bytes());
-        bytes[at + 16..at + 16 + body.len()].copy_from_slice(body);
-        bytes[0..4].copy_from_slice(&((size + total) as u32).to_ne_bytes());
-        true
+        atom::seq_append(atom::as_bytes_mut(&mut self.atom_in[buf]), frame, type_, body)
     }
 
     /// Append MIDI events to the MIDI atom sequence (after `prepare_atoms`).
@@ -971,70 +928,29 @@ impl PluginRuntime {
             return;
         }
         let inst = &self.insts[0];
+        let tx = &mut self.dsp_tx;
         for (buf, &port) in inst.atom_out.iter().zip(&inst.atom_out_ports) {
-            let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 8) };
-            let size = u32::from_ne_bytes(bytes[0..4].try_into().unwrap()) as usize;
-            let type_ = u32::from_ne_bytes(bytes[4..8].try_into().unwrap());
-            if type_ != self.seq_urid {
-                continue; // the plugin wrote nothing this cycle
-            }
-            let end = (8 + size).min(bytes.len());
-            let mut at = 16; // atom header + sequence body
-            while at + 16 <= end {
-                let asize = u32::from_ne_bytes(bytes[at + 8..at + 12].try_into().unwrap()) as usize;
-                let atom = &bytes[at + 8..(at + 16 + asize).min(end)];
-                let need = 8 + atom.len();
-                if self.dsp_tx.slots() >= need
-                    && let Ok(mut chunk) = self.dsp_tx.write_chunk_uninit(need)
-                {
-                    let msg = port.to_ne_bytes().into_iter().chain((atom.len() as u32).to_ne_bytes()).chain(atom.iter().copied());
-                    let (a, b) = chunk.as_mut_slices();
-                    for (dst, v) in a.iter_mut().chain(b.iter_mut()).zip(msg) {
-                        dst.write(v);
-                    }
-                    unsafe { chunk.commit_all() };
-                }
-                at += 16 + asize.div_ceil(8) * 8;
-            }
+            atom::for_each_event(atom::as_bytes(buf), self.seq_urid, |ev| {
+                // Dropped when the GUI queue is full.
+                frames::push(tx, &port_header(port, ev.len()), ev);
+            });
         }
     }
 
     /// Deliver queued GUI messages to the first instance's atom inputs.
     fn deliver_ui_messages(&mut self) {
         let inst = &mut self.insts[0];
-        loop {
-            let avail = self.ui_rx.slots();
-            if avail < 8 {
-                break;
-            }
-            // Peek at the header (an uncommitted read consumes nothing).
-            let mut h = [0u8; 8];
-            {
-                let Ok(head) = self.ui_rx.read_chunk(8) else { break };
-                let (a, b) = head.as_slices();
-                for (d, s) in h.iter_mut().zip(a.iter().chain(b)) {
-                    *d = *s;
-                }
-            }
-            let port = u32::from_ne_bytes(h[0..4].try_into().unwrap());
-            let len = u32::from_ne_bytes(h[4..8].try_into().unwrap()) as usize;
-            if avail < 8 + len {
-                break; // message not fully written yet
-            }
-            let Ok(chunk) = self.ui_rx.read_chunk(8 + len) else { break };
-            let (a, b) = chunk.as_slices();
-            let n = len.min(self.scratch.len());
-            for (d, s) in self.scratch[..n].iter_mut().zip(a.iter().chain(b).skip(8)) {
-                *d = *s;
-            }
-            chunk.commit_all();
+        let scratch = &mut self.scratch;
+        while let Some((port, n)) =
+            frames::pop_with::<8, _>(&mut self.ui_rx, |h, a, b| (u32::from_ne_bytes([h[0], h[1], h[2], h[3]]), frames::copy_body(a, b, scratch)))
+        {
             if n < 8 {
                 continue;
             }
             // The message is a whole LV2_Atom: header { size, type } + body.
-            let type_ = u32::from_ne_bytes(self.scratch[4..8].try_into().unwrap());
+            let type_ = u32::from_ne_bytes([scratch[4], scratch[5], scratch[6], scratch[7]]);
             if let Some(buf) = inst.atom_in_ports.iter().position(|p| *p == port) {
-                inst.append_event(buf, 0, type_, &self.scratch[8..n]);
+                inst.append_event(buf, 0, type_, &scratch[8..n]);
             }
         }
     }
@@ -1163,46 +1079,20 @@ struct WorkerInterface {
 }
 
 fn push_msg(tx: &mut rtrb::Producer<u8>, data: &[u8]) -> bool {
-    let need = 4 + data.len();
-    if tx.slots() < need {
-        return false;
-    }
-    let Ok(mut chunk) = tx.write_chunk_uninit(need) else { return false };
-    let msg = (data.len() as u32).to_ne_bytes().into_iter().chain(data.iter().copied());
-    let (a, b) = chunk.as_mut_slices();
-    for (dst, v) in a.iter_mut().chain(b.iter_mut()).zip(msg) {
-        dst.write(v);
-    }
-    unsafe { chunk.commit_all() };
-    true
+    frames::push(tx, &(data.len() as u32).to_ne_bytes(), data)
 }
 
 /// Pop one message into `out`; returns its length.
 fn pop_msg(rx: &mut rtrb::Consumer<u8>, out: &mut [u8]) -> Option<usize> {
-    let avail = rx.slots();
-    if avail < 4 {
-        return None;
-    }
-    let mut h = [0u8; 4];
-    {
-        let head = rx.read_chunk(4).ok()?;
-        let (a, b) = head.as_slices();
-        for (d, s) in h.iter_mut().zip(a.iter().chain(b)) {
-            *d = *s;
-        }
-    }
-    let len = u32::from_ne_bytes(h) as usize;
-    if avail < 4 + len {
-        return None;
-    }
-    let chunk = rx.read_chunk(4 + len).ok()?;
-    let (a, b) = chunk.as_slices();
-    let n = len.min(out.len());
-    for (d, s) in out[..n].iter_mut().zip(a.iter().chain(b).skip(4)) {
-        *d = *s;
-    }
-    chunk.commit_all();
-    Some(n)
+    frames::pop_with::<4, _>(rx, |_, a, b| frames::copy_body(a, b, out))
+}
+
+/// Header for port-addressed messages: [port u32][len u32].
+fn port_header(port: u32, len: usize) -> [u8; 8] {
+    let mut h = [0u8; 8];
+    h[..4].copy_from_slice(&port.to_ne_bytes());
+    h[4..].copy_from_slice(&(len as u32).to_ne_bytes());
+    h
 }
 
 unsafe extern "C" fn schedule_work_cb(handle: P, size: u32, data: *const c_void) -> u32 {

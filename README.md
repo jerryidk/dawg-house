@@ -87,6 +87,8 @@ The UI uses [egui](https://github.com/emilk/egui) (via `eframe`, OpenGL; Wayland
 
 ## Tests
 
+The code at the plugin and driver boundaries is also model-checked with Kani: see [VERIFICATION.md](VERIFICATION.md) (`scripts/kani.sh`).
+
 ```sh
 cargo test                                    # unit + headless UI tests (egui_kittest)
 jackd -n studiotest -d dummy &                # optional: end-to-end through JACK

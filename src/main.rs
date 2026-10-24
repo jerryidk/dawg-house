@@ -1,10 +1,12 @@
 mod app;
+mod atom;
 mod audio;
 mod backend;
 mod builtin;
 mod device;
 mod engine;
 mod export;
+mod frames;
 mod lv2;
 mod lv2ui;
 mod project;
@@ -100,6 +102,8 @@ fn main() -> eframe::Result {
     eframe::run_native("Studio", options, Box::new(move |cc| Ok(Box::new(app::StudioApp::new(cc, project)))))
 }
 
+#[cfg(kani)]
+mod verification;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

@@ -41,6 +41,14 @@ impl MidiInEvent {
     }
 }
 
+/// Split interleaved samples (`a` then `b`: one possibly wrapped ring read)
+/// into per-channel buffers.
+pub fn deinterleave(a: &[f32], b: &[f32], ch: usize, bufs: &mut [Vec<f32>]) {
+    for (i, s) in a.iter().chain(b).enumerate() {
+        bufs[i % ch][i / ch] = *s;
+    }
+}
+
 /// One cycle of device buffers.
 pub struct DeviceIo<'a> {
     pub frames: usize,
@@ -178,9 +186,7 @@ impl DeviceRunner {
         let avail = rx.slots().min(want) / ch * ch;
         if let Ok(chunk) = rx.read_chunk(avail) {
             let (a, b) = chunk.as_slices();
-            for (i, s) in a.iter().chain(b).enumerate() {
-                self.in_bufs[i % ch][i / ch] = *s;
-            }
+            deinterleave(a, b, ch, &mut self.in_bufs);
             chunk.commit_all();
         }
         let got = avail / ch;

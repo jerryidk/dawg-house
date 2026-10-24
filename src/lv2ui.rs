@@ -190,16 +190,32 @@ unsafe extern "C" fn ui_write(controller: P, port: u32, size: u32, protocol: u32
     if buffer.is_null() {
         return;
     }
-    if protocol == 0 && size as usize >= 4 {
+    if protocol == 0 {
         // Plain control value.
-        if let Some(k) = c.link.control_in_ports.iter().position(|p| *p == port) {
-            c.shared.params[k].set(unsafe { *(buffer as *const f32) });
+        if let Some(k) = c.link.control_in_ports.iter().position(|p| *p == port)
+            && let Some(v) = unsafe { decode_control(size, buffer) }
+        {
+            c.shared.params[k].set(v);
         }
     } else if protocol == c.event_transfer {
         // A whole LV2_Atom for an atom input port (e.g. patch:Set messages).
         let bytes = unsafe { std::slice::from_raw_parts(buffer as *const u8, size as usize) };
         c.link.send_atom(port, bytes);
     }
+}
+
+/// A control value written by a plugin GUI (`protocol` 0): a float at
+/// `buffer`, if `size` says there is one.
+///
+/// # Safety
+/// `buffer` must point to at least `size` readable bytes (the GUI's promise).
+pub(crate) unsafe fn decode_control(size: u32, buffer: *const c_void) -> Option<f32> {
+    if size < 4 || buffer.is_null() {
+        return None;
+    }
+    // The GUI's pointer need not be 4-byte aligned (found by Kani:
+    // `gui_control_value_any_pointer`); a plain `*ptr` read would be UB.
+    Some(unsafe { std::ptr::read_unaligned(buffer as *const f32) })
 }
 
 /// Feature array for a GUI instance. Boxed so pointers stay valid.

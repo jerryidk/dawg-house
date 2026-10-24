@@ -31,3 +31,7 @@ asio = ["cpal/asio"]
 
 [dev-dependencies]
 egui_kittest = { version = "0.35", features = ["eframe"] }
+
+[lints.rust]
+# `cfg(kani)` is set by the Kani model checker (`cargo kani`); see VERIFICATION.md.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

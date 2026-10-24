@@ -31,8 +31,10 @@ impl AudioData {
     /// Sample of channel `ch` (mono sources feed both channels).
     #[inline]
     pub fn sample(&self, ch: usize, i: usize) -> f32 {
-        let c = &self.channels[ch.min(self.channels.len() - 1)];
-        c.get(i).copied().unwrap_or(0.0)
+        // Runs on the audio thread: never panic, even for empty data
+        // (found by Kani: `audio_sample_any_shape`).
+        let Some(last) = self.channels.len().checked_sub(1) else { return 0.0 };
+        self.channels[ch.min(last)].get(i).copied().unwrap_or(0.0)
     }
 
     /// Min/max of the waveform between frames `a` and `b`.

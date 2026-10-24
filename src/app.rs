@@ -116,6 +116,7 @@ pub struct StudioApp {
     pub recording_snippet: Option<Id>,
     pub drag: Option<Drag>,
     pub roll: RollState,
+    pub wave: crate::waveedit::WaveState,
     pub bottom: BottomTab,
     pub lane_rects: Vec<(Id, egui::Rect)>,
     pub snippet_rects: Vec<(Id, egui::Rect)>,
@@ -164,6 +165,7 @@ impl StudioApp {
             recording_snippet: None,
             drag: None,
             roll: RollState::default(),
+            wave: Default::default(),
             bottom: BottomTab::Takes,
             lane_rects: vec![],
             snippet_rects: vec![],
@@ -488,6 +490,7 @@ impl StudioApp {
         self.sel.snippet = Some(id);
         self.sel.track = Some(track);
         self.sel.clip = None;
+        self.sel.take = None;
         self.set_scope(PlayScope::Snippet(id));
         self.arrangement_dirty = true;
     }
@@ -591,7 +594,7 @@ impl StudioApp {
         let Some(s) = self.project.snippet_mut(snippet) else { return };
         for (id, (content, offset)) in ids.into_iter().zip(contents) {
             let name = format!("Take {}", s.takes.len() + 1);
-            s.takes.push(Take { id, name, content, offset });
+            s.takes.push(Take::new(id, name, content, offset));
             s.active = Some(id);
         }
         let msg = format!("{} take(s) in {}", s.takes.len(), s.name);
@@ -1612,50 +1615,6 @@ impl StudioApp {
         }
     }
 
-    fn clip_inspector(&mut self, ui: &mut egui::Ui, clip: Id) {
-        let rate = self.rate();
-        let Some(c) = self.project.clip_mut(clip) else { return };
-        let mut changed = false;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{} {}", icon::WAVEFORM, c.name)).strong());
-        });
-        egui::Grid::new("clip_inspector").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-            ui.label("Name");
-            ui.text_edit_singleline(&mut c.name);
-            ui.end_row();
-            ui.label("Gain");
-            let mut db = crate::util::gain_to_db(c.gain);
-            if ui.add(egui::Slider::new(&mut db, -40.0..=12.0).suffix(" dB")).changed() {
-                c.gain = db_to_gain(db);
-                changed = true;
-            }
-            ui.end_row();
-            let ms = |s: u64| s as f32 / rate as f32 * 1000.0;
-            let max_fade = c.length as f32 / rate as f32 * 1000.0;
-            for (label, v) in [("Fade in", &mut c.fade_in), ("Fade out", &mut c.fade_out)] {
-                ui.label(label);
-                let mut m = ms(*v);
-                if ui.add(egui::Slider::new(&mut m, 0.0..=max_fade.min(10000.0)).suffix(" ms")).changed() {
-                    *v = (m / 1000.0 * rate as f32) as u64;
-                    changed = true;
-                }
-                ui.end_row();
-            }
-            ui.label("Muted");
-            changed |= ui.checkbox(&mut c.muted, "").changed();
-            ui.end_row();
-            ui.label("Position");
-            ui.label(format_time(c.start, rate));
-            ui.end_row();
-            ui.label("Length");
-            ui.label(format_time(c.length as i64, rate));
-            ui.end_row();
-        });
-        if changed {
-            self.arrangement_dirty = true;
-        }
-    }
-
     fn bottom_tabs(&mut self, ui: &mut egui::Ui) {
         ui.selectable_value(&mut self.bottom, BottomTab::Takes, format!("{} Takes", icon::STACK));
         ui.selectable_value(&mut self.bottom, BottomTab::Editor, format!("{} Editor", icon::PIANO_KEYS));
@@ -1676,32 +1635,37 @@ impl StudioApp {
             },
             BottomTab::Devices => self.device_panel(ui),
             BottomTab::Editor => {
-                // A MIDI take opened from the Takes tab wins over the timeline selection.
-                if let Some(take) = self.sel.take.filter(|t| self.project.find_take(*t).is_some()) {
-                    self.piano_roll(ui, take);
-                    return;
-                }
-                let clip = self.sel.clip.and_then(|c| self.project.find_clip(c).map(|(t, i)| &self.project.tracks[t].clips[i]));
-                match clip.map(|c| (c.id, c.content.clone())) {
-                    Some((id, ClipContent::Midi { .. })) => self.piano_roll(ui, id),
-                    Some((id, ClipContent::Audio { .. })) => self.clip_inspector(ui, id),
-                    Some((_, ClipContent::Snippet { snippet })) => {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("{} Linked placement — edit the snippet itself", icon::LINK)).color(TEXT_DIM));
-                            if ui.button("Open snippet").clicked() {
-                                self.sel.snippet = Some(snippet);
-                                self.bottom = BottomTab::Takes;
-                            }
-                        });
-                    }
-                    None => {
+                let rate = self.rate();
+                let target = self.editor_target();
+                let is_midi = target.and_then(|id| self.project.region_mut(id, rate)).map(|(_, r)| matches!(r.fields().content, ClipContent::Midi { .. }));
+                match (target, is_midi) {
+                    (Some(id), Some(true)) => self.piano_roll(ui, id),
+                    (Some(id), Some(false)) => self.wave_editor(ui, id),
+                    _ => {
                         ui.centered_and_justified(|ui| {
-                            ui.label(RichText::new("Select a clip or a MIDI take to edit it").color(TEXT_DIM))
+                            ui.label(RichText::new("Select a clip, a snippet or a take to edit it").color(TEXT_DIM))
                         });
                     }
                 }
             }
         }
+    }
+
+    /// The region the Editor shows: a take opened from the Takes tab, else the
+    /// selected clip (a linked placement edits its snippet's active take), else
+    /// the selected snippet's active take.
+    pub fn editor_target(&self) -> Option<Id> {
+        if let Some(t) = self.sel.take.filter(|t| self.project.find_take(*t).is_some()) {
+            return Some(t);
+        }
+        if let Some((ti, ci)) = self.sel.clip.and_then(|c| self.project.find_clip(c)) {
+            let c = &self.project.tracks[ti].clips[ci];
+            return match c.content {
+                ClipContent::Snippet { snippet } => self.project.snippet(snippet).and_then(|s| s.active),
+                _ => Some(c.id),
+            };
+        }
+        self.sel.snippet.and_then(|s| self.project.snippet(s)).and_then(|s| s.active)
     }
 
     /// Header strip of a foldable panel. Returns true if folded.

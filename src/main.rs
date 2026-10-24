@@ -13,6 +13,7 @@ mod pianoroll;
 mod snippets;
 mod song;
 mod util;
+mod waveedit;
 
 use std::os::unix::process::CommandExt;
 

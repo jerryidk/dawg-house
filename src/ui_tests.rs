@@ -357,3 +357,88 @@ fn export_song_to_wav_and_mp3() {
     h.get_by_label("MP3 192 kbps");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn waveform_editor_edits_takes_and_clips() {
+    use crate::project::Take;
+    let mut h = harness();
+    let track = h.state().project.tracks[0].id;
+    let snippet = h.state().project.tracks[0].snippets[0].id;
+    let (take, period, spb) = {
+        let app = h.state_mut();
+        let rate = app.rate();
+        let s = app.project.snippet(snippet).unwrap();
+        let (period, spb) = (s.length(rate), s.samples_per_beat(rate));
+        let data = crate::audio::AudioData::new("loop.wav".into(), vec![(0..period as usize * 3).map(|i| (i as f32 * 0.01).sin() * 0.6).collect(); 2]);
+        let source = app.project.alloc_id();
+        app.sources.insert(source, std::sync::Arc::new(data));
+        let take = app.project.alloc_id();
+        let s = app.project.snippet_mut(snippet).unwrap();
+        s.takes.push(Take::new(take, "Take 1".into(), ClipContent::Audio { source }, 2 * spb as u64));
+        s.active = Some(take);
+        app.select_snippet(snippet);
+        app.bottom = BottomTab::Editor;
+        (take, period, spb)
+    };
+    h.run_steps(3);
+    assert_eq!(h.state().editor_target(), Some(take), "a selected snippet edits its active take");
+    let area = h.state().wave.area;
+    assert!(area.width() > 100.0, "waveform editor not shown");
+    let geo = |h: &Harness<StudioApp>| {
+        let w = &h.state().wave;
+        let x_of = |t: f64| w.area.left() + ((t / spb - w.scroll) * w.ppb as f64) as f32;
+        (x_of(0.0), x_of(period as f64), w.ppb, w.area.top() + 18.0)
+    };
+    let offset = |h: &Harness<StudioApp>| h.state().project.snippet(snippet).unwrap().takes[0].offset;
+
+    // Slip: dragging the audio one beat to the right starts it one beat earlier.
+    let (x0, _, ppb, _) = geo(&h);
+    let y = area.center().y + 10.0;
+    drag(&mut h, pos2(x0 + 80.0, y), pos2(x0 + 80.0 + ppb, y));
+    assert_eq!(offset(&h), spb as u64, "slip should move the take one beat");
+
+    // Ctrl+wheel zoom around the pointer.
+    let before = h.state().wave.ppb;
+    h.event(Event::PointerMoved(area.center()));
+    h.event(Event::Zoom(1.5));
+    h.run_steps(2);
+    assert!(h.state().wave.ppb > before * 1.3, "zoom in");
+
+    // Fade-in handle at the region start (Fit brings it back into view).
+    h.get_by_label("Fit").click();
+    h.run_steps(2);
+    let (x0, _, ppb, top) = geo(&h);
+    assert!(x0 > area.left(), "region start visible after Fit");
+    drag(&mut h, pos2(x0, top + 4.0), pos2(x0 + ppb, top + 4.0));
+    let fade = h.state().project.snippet(snippet).unwrap().takes[0].fade_in;
+    assert!(fade > 0, "fade-in should be set");
+
+    // The Takes tab's Edit button opens audio takes in the editor too.
+    h.state_mut().bottom = BottomTab::Takes;
+    h.run_steps(2);
+    h.get_by_label(&format!("{} Edit", egui_phosphor::regular::PENCIL_SIMPLE)).click();
+    h.run_steps(2);
+    assert!(h.state().bottom == BottomTab::Editor);
+    assert_eq!(h.state().sel.take, Some(take));
+
+    // A timeline audio clip: trim its end by one beat in the same editor.
+    {
+        let app = h.state_mut();
+        let data = crate::audio::AudioData::new("clip.wav".into(), vec![vec![0.3; 96000 * 4]]);
+        app.add_audio_clip(track, data, 0, "clip".into());
+        let clip = app.project.track(track).unwrap().clips[0].id;
+        app.sel = crate::app::Selection { track: Some(track), clip: Some(clip), ..Default::default() };
+        app.set_scope(crate::song::PlayScope::Song);
+        app.bottom = BottomTab::Editor;
+    }
+    h.run_steps(3);
+    let clip = h.state().project.track(track).unwrap().clips[0].clone();
+    assert_eq!(h.state().editor_target(), Some(clip.id), "a selected audio clip opens in the waveform editor");
+    let spb = h.state().project.samples_per_beat(h.state().rate());
+    let w = &h.state().wave;
+    let x_end = w.area.left() + ((clip.length as f64 / spb - w.scroll) * w.ppb as f64) as f32;
+    let ppb = w.ppb;
+    drag(&mut h, pos2(x_end, y), pos2(x_end - ppb, y));
+    let new_len = h.state().project.track(track).unwrap().clips[0].length;
+    assert_eq!(new_len, clip.length - spb as u64, "trim end by one beat");
+}

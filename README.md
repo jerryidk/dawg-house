@@ -39,6 +39,7 @@ The window has three foldable panels: **Snippets** (one column per track), **Tim
 * **Editing:** drag a clip to move it (also between tracks of the same kind), drag its edges to trim, and drag the top handles of audio clips for fades. **S** splits at the playhead, **Ctrl+D** duplicates, **Del** deletes, **Ctrl+Z / Ctrl+Shift+Z** undo and redo. Snap follows the visible grid; hold **Alt** to bypass it.
 * **Piano roll:** double-click an instrument lane to create a MIDI clip. In the **Editor** tab, click to add a note, drag to move, drag the right edge to resize, and right-click to delete. Drag in the velocity lane to set velocity. **Q** quantizes.
 * **Devices:** in the **Devices** tab, add LV2 or built-in devices, bypass, reorder and remove them, and edit their parameters. Plugins that ship their own interface (e.g. TONE3000) have an **Open GUI** button, which opens it in a separate window (X11; XWayland on Wayland desktops). A plugin's internal state, such as a loaded amp model, is saved in the project.
+* **Editor tab:** timeline clips and snippet takes use the same editors. MIDI opens in the piano roll and audio in the **waveform editor**. The editor shows the selected clip, the selected snippet's active take, or a take opened with **Edit** in the Takes tab. The waveform editor draws the audio against the region's own bars and beats (the snippet's tempo and meter for takes). Zoom with Ctrl+wheel, −/+ or Fit. Drag the audio to slip it against the grid (snapped; hold Alt for free movement), drag the edges to trim timeline clips, drag the top corners for fades, and set gain. A take's gain and fades apply on every loop pass.
 * **Navigation:** Space play/pause, Home to the start, Ctrl+wheel zoom, Shift+wheel scroll. Click the ruler to move the playhead.
 * **Files:** save and open projects (`.studio`, JSON) and import WAV files (Ctrl+I, or drop them on a lane).
 * **Export:** **File → Export audio…** (Ctrl+E) renders the timeline offline, faster than real time and with every device and plugin, to WAV (16-bit, 24-bit or 32-bit float) or MP3 (320/192 kbps, via the system's `libmp3lame0`). A tail setting lets reverbs and note releases ring out after the last clip.
@@ -62,6 +63,7 @@ src/
   snippets.rs   snippet columns and the Takes tab
   timeline.rs   linear timeline (headers, lanes, placements, non-destructive clip editing)
   pianoroll.rs  MIDI editor
+  waveedit.rs   waveform editor for audio clips and takes
   theme.rs      visual style and small widgets
 ```
 

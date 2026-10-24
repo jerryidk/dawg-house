@@ -58,6 +58,85 @@ pub struct Take {
     pub content: ClipContent,
     /// First source frame used (audio takes cut from a loop recording).
     pub offset: u64,
+    #[serde(default = "unity")]
+    pub gain: f32,
+    /// Fades at the take's own start/end (applied on every loop pass).
+    #[serde(default)]
+    pub fade_in: u64,
+    #[serde(default)]
+    pub fade_out: u64,
+}
+
+fn unity() -> f32 {
+    1.0
+}
+
+impl Take {
+    pub fn new(id: Id, name: String, content: ClipContent, offset: u64) -> Self {
+        Take { id, name, content, offset, gain: 1.0, fade_in: 0, fade_out: 0 }
+    }
+}
+
+/// Mutable view of the fields every region has.
+pub struct RegionFields<'a> {
+    pub name: &'a mut String,
+    pub content: &'a mut ClipContent,
+    pub offset: &'a mut u64,
+    pub gain: &'a mut f32,
+    pub fade_in: &'a mut u64,
+    pub fade_out: &'a mut u64,
+}
+
+/// What timeline clips and snippet takes have in common: a window onto audio
+/// or MIDI content with its own offset, gain and fades. Editors work on
+/// `dyn Region`, so clips and takes get the same tools (Rust's shared-interface
+/// take on inheritance).
+pub trait Region {
+    fn fields(&mut self) -> RegionFields<'_>;
+}
+
+impl Region for Clip {
+    fn fields(&mut self) -> RegionFields<'_> {
+        RegionFields {
+            name: &mut self.name,
+            content: &mut self.content,
+            offset: &mut self.offset,
+            gain: &mut self.gain,
+            fade_in: &mut self.fade_in,
+            fade_out: &mut self.fade_out,
+        }
+    }
+}
+
+impl Region for Take {
+    fn fields(&mut self) -> RegionFields<'_> {
+        RegionFields {
+            name: &mut self.name,
+            content: &mut self.content,
+            offset: &mut self.offset,
+            gain: &mut self.gain,
+            fade_in: &mut self.fade_in,
+            fade_out: &mut self.fade_out,
+        }
+    }
+}
+
+/// Where a region lives and the musical grid it is edited against.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RegionContext {
+    /// Length in samples (a take is as long as its snippet).
+    pub length: u64,
+    pub samples_per_beat: f64,
+    pub beats_per_bar: u32,
+    pub owner: RegionOwner,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegionOwner {
+    /// A clip on the timeline (can be trimmed).
+    Clip { track: Id, start: i64 },
+    /// A take of a snippet (length fixed by the snippet).
+    Take { track: Id, snippet: Id },
 }
 
 /// A short piece of one track's part, recorded against its own tempo/meter.
@@ -434,16 +513,32 @@ impl Project {
         }
     }
 
-    /// Notes of a free MIDI clip or of a MIDI take (ids are unique project-wide).
-    pub fn notes_mut(&mut self, id: Id) -> Option<&mut Vec<Note>> {
+    /// A clip or take by id (ids are unique project-wide), with its context.
+    pub fn region_mut(&mut self, id: Id, rate: u32) -> Option<(RegionContext, &mut dyn Region)> {
         if let Some((t, c)) = self.find_clip(id) {
-            return match &mut self.tracks[t].clips[c].content {
-                ClipContent::Midi { notes } => Some(notes),
-                _ => None,
+            let ctx = RegionContext {
+                length: self.tracks[t].clips[c].length,
+                samples_per_beat: self.samples_per_beat(rate),
+                beats_per_bar: 4,
+                owner: RegionOwner::Clip { track: self.tracks[t].id, start: self.tracks[t].clips[c].start },
             };
+            return Some((ctx, &mut self.tracks[t].clips[c]));
         }
         let (t, s, k) = self.find_take(id)?;
-        match &mut self.tracks[t].snippets[s].takes[k].content {
+        let sn = &self.tracks[t].snippets[s];
+        let ctx = RegionContext {
+            length: sn.length(rate),
+            samples_per_beat: sn.samples_per_beat(rate),
+            beats_per_bar: sn.beats_per_bar,
+            owner: RegionOwner::Take { track: self.tracks[t].id, snippet: sn.id },
+        };
+        Some((ctx, &mut self.tracks[t].snippets[s].takes[k]))
+    }
+
+    /// Notes of a free MIDI clip or of a MIDI take.
+    pub fn notes_mut(&mut self, id: Id) -> Option<&mut Vec<Note>> {
+        let (_, region) = self.region_mut(id, 48000)?;
+        match region.fields().content {
             ClipContent::Midi { notes } => Some(notes),
             _ => None,
         }

@@ -397,7 +397,8 @@ impl StudioApp {
                                 ClipContent::Snippet { .. } => String::new(),
                             };
                             ui.label(RichText::new(info).small().color(TEXT_DIM));
-                            if matches!(k.content, ClipContent::Midi { .. }) && ui.button(format!("{} Edit", icon::PENCIL_SIMPLE)).clicked() {
+                            let tip = if matches!(k.content, ClipContent::Midi { .. }) { "Edit notes in the piano roll" } else { "Edit in the waveform editor" };
+                            if ui.button(format!("{} Edit", icon::PENCIL_SIMPLE)).on_hover_text(tip).clicked() {
                                 edit_notes = Some(k.id);
                             }
                             if theme::icon_button(ui, icon::TRASH, "Delete take").clicked() {
@@ -431,7 +432,7 @@ impl StudioApp {
             let take = self.project.alloc_id();
             if let Some(s) = self.project.snippet_mut(id) {
                 let name = format!("Take {}", s.takes.len() + 1);
-                s.takes.push(crate::project::Take { id: take, name, content: ClipContent::Midi { notes: vec![] }, offset: 0 });
+                s.takes.push(crate::project::Take::new(take, name, ClipContent::Midi { notes: vec![] }, 0));
                 s.active = Some(take);
             }
             self.sel.take = Some(take);

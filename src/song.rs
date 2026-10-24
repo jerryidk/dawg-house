@@ -68,12 +68,18 @@ pub fn snippet_window(
         if let Some(content) = content
             && b > a
         {
+            // The take's own fades apply at each pass boundary; the
+            // placement's fades win at the edges of the placement.
+            let pass_start = a == k * period;
+            let pass_end = b == (k + 1) * period;
+            let fade_in = if a == w0 && fades.0 > 0 { fades.0 } else if pass_start { take.fade_in } else { 0 };
+            let fade_out = if b == w1 && fades.1 > 0 { fades.1 } else if pass_end { take.fade_out } else { 0 };
             out.push(PlayClip {
                 start: start + (a - w0) as i64,
                 length: (b - a) as usize,
-                gain,
-                fade_in: if a == w0 { fades.0 as usize } else { 0 },
-                fade_out: if b == w1 { fades.1 as usize } else { 0 },
+                gain: gain * take.gain,
+                fade_in: fade_in as usize,
+                fade_out: fade_out as usize,
                 content,
             });
         }

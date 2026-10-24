@@ -216,7 +216,7 @@ fn snippet_project() -> (Project, u64, u64, crate::song::Sources) {
     for (i, off) in [0u64, 96000, 192000].into_iter().enumerate() {
         let id = p.alloc_id();
         let s = p.snippet_mut(snippet).unwrap();
-        s.takes.push(crate::project::Take { id, name: format!("Take {}", i + 1), content: ClipContent::Audio { source: 500 }, offset: off });
+        s.takes.push(crate::project::Take::new(id, format!("Take {}", i + 1), ClipContent::Audio { source: 500 }, off));
         s.active = Some(id);
     }
     (p, track, snippet, sources)
@@ -295,7 +295,7 @@ fn snippet_loop_uses_cued_backing_and_mutes_focus_when_recording() {
     p.snippet_mut(beat).unwrap().bars = 1;
     let take = p.alloc_id();
     let s = p.snippet_mut(beat).unwrap();
-    s.takes.push(crate::project::Take { id: take, name: "t".into(), content: ClipContent::Audio { source: 500 }, offset: 0 });
+    s.takes.push(crate::project::Take::new(take, "t".into(), ClipContent::Audio { source: 500 }, 0));
     s.active = Some(take);
     // Loop the 2-bar snippet: the 1-bar drum snippet repeats twice underneath.
     p.snippet_mut(snippet).unwrap().bars = 2;
@@ -540,4 +540,31 @@ fn x42_tuner_gui_with_egl_context_current() {
     let errors = crate::lv2ui::take_x_errors();
     println!("EGL thread: {errors:?}");
     assert!(errors.iter().any(|e| e.contains("BadAccess")), "expected the GLX BadAccess to be reported, got {errors:?}");
+}
+
+#[test]
+fn clips_and_takes_edit_through_one_region_interface() {
+    use crate::engine::PlayContent;
+    let (mut p, track, snippet, sources) = snippet_project();
+    let take = p.snippet(snippet).unwrap().active.unwrap();
+    let clip = p.place_snippet(snippet, 0, 48000).unwrap();
+    // Same code edits a take and a clip.
+    for id in [take, clip] {
+        let (_, r) = p.region_mut(id, 48000).unwrap();
+        let f = r.fields();
+        *f.gain = 0.5;
+        *f.fade_in = 100;
+    }
+    let (ctx, _) = p.region_mut(take, 48000).unwrap();
+    assert_eq!(ctx.length, 96000);
+    assert_eq!(ctx.owner, crate::project::RegionOwner::Take { track, snippet });
+    // Take gain and fades reach playback on every loop pass; the placement
+    // gain multiplies and its own fade-in wins at the placement start.
+    p.clip_mut(clip).unwrap().length = 96000 * 2;
+    let arr = crate::song::compile_song(&p, &sources, 48000);
+    let clips = &arr.tracks[0].1;
+    assert_eq!(clips.len(), 2);
+    assert!(clips.iter().all(|c| (c.gain - 0.25).abs() < 1e-6));
+    assert_eq!((clips[0].fade_in, clips[1].fade_in), (100, 100));
+    assert!(matches!(&clips[1].content, PlayContent::Audio { offset, .. } if *offset == 192000));
 }

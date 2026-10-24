@@ -6,6 +6,9 @@ Studio also has non-destructive editing, audio and instrument (MIDI) tracks, and
 
 ## Build and run
 
+See [DEPENDENCIES.md](DEPENDENCIES.md) for every runtime library, the sound stack and notes on portability.
+
+
 ```sh
 sudo apt install pipewire-jack   # PipeWire's libjack (recommended)
 cargo run --release

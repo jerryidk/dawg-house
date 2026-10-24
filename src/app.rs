@@ -3,7 +3,7 @@
 
 use crate::audio::{self, AudioData, Recorder};
 use crate::device::{DeviceCategory, DeviceRegistry, DeviceShared};
-use crate::engine::{AUDIO_PORT, Command, Engine, MAX_DEVICES, MAX_TRACKS, MIDI_PORT};
+use crate::engine::{Command, Engine, MAX_DEVICES, MAX_TRACKS};
 use crate::pianoroll::RollState;
 use crate::project::{Clip, ClipContent, DeviceSlot, History, Id, Note, Project, SourceRef, Take, TrackKind};
 use crate::song::{self, PlayScope};
@@ -19,7 +19,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 /// "All MIDI inputs" marker stored in `Track::input_l` of instrument tracks.
-pub const ALL_MIDI: &str = "*";
+pub const ALL_MIDI: &str = crate::backend::ALL_SOURCES;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BottomTab {
@@ -231,8 +231,8 @@ impl StudioApp {
     }
 
     fn refresh_ports(&mut self) {
-        self.audio_ports = self.engine.source_ports(AUDIO_PORT);
-        self.midi_ports = self.engine.source_ports(MIDI_PORT);
+        self.audio_ports = self.engine.sources(TrackKind::Audio);
+        self.midi_ports = self.engine.sources(TrackKind::Instrument);
         self.output_devices = self.engine.playback_devices();
         self.master_device = self.engine.master_output();
         self.ports_refreshed = Some(Instant::now());
@@ -278,26 +278,11 @@ impl StudioApp {
 
     pub fn connect_track_inputs(&mut self, id: Id) {
         let Some(t) = self.project.track(id) else { return };
-        match t.kind {
-            TrackKind::Audio => {
-                self.engine.connect_input(&format!("track{id}_in_L"), t.input_l.as_deref());
-                let r = if t.stereo { t.input_r.as_deref() } else { None };
-                self.engine.connect_input(&format!("track{id}_in_R"), r);
-            }
-            TrackKind::Instrument => {
-                let port = format!("track{id}_midi_in");
-                if t.input_l.as_deref() == Some(ALL_MIDI) {
-                    self.engine.connect_input(&port, None);
-                    if let Some(c) = self.engine.client() {
-                        let dst = self.engine.port_name(&port);
-                        for src in &self.midi_ports {
-                            let _ = c.connect_ports_by_name(src, &dst);
-                        }
-                    }
-                } else {
-                    self.engine.connect_input(&port, t.input_l.as_deref());
-                }
-            }
+        let (kind, shared, left) = (t.kind, t.shared.clone(), t.input_l.clone());
+        let right = if t.stereo { t.input_r.clone() } else { None };
+        self.engine.connect_input(id, kind, &shared, 0, left.as_deref());
+        if kind == TrackKind::Audio {
+            self.engine.connect_input(id, kind, &shared, 1, right.as_deref());
         }
     }
 
@@ -1286,7 +1271,7 @@ impl StudioApp {
             .width(150.0)
             .show_ui(ui, |ui| {
                 theme::section_label(ui, "Frames per period — latency");
-                for n in [32u32, 64, 128, 256, 512, 1024, 2048, 4096] {
+                for n in self.engine.buffer_sizes() {
                     let text = format!("{n:>5} frames   {:>6.1} ms   (round trip ≈ {:.1} ms)", ms(n), 2.0 * ms(n));
                     if ui.selectable_label(n == current, RichText::new(text).monospace()).clicked() {
                         pick = Some(n);
@@ -1294,7 +1279,7 @@ impl StudioApp {
                 }
             })
             .response
-            .on_hover_text(if self.engine.pipewire {
+            .on_hover_text(if self.engine.backend_name().contains("PipeWire") {
                 "Smaller = lower latency but more CPU and risk of xruns.\nUnder PipeWire this forces the quantum of the whole audio graph."
             } else {
                 "Smaller = lower latency but more CPU and risk of xruns."
@@ -1463,7 +1448,7 @@ impl StudioApp {
         ui.horizontal(|ui| {
             let e = &self.engine;
             if e.is_running() {
-                let backend = if e.pipewire { "PipeWire (JACK)" } else { "JACK" };
+                let backend = e.backend_name();
                 let rate = e.sample_rate;
                 ui.label(RichText::new(format!("{} {backend}", icon::PLUGS)).color(theme::SOLO));
                 ui.label(RichText::new(format!("{:.1} kHz", rate as f32 / 1000.0)).color(TEXT_DIM));

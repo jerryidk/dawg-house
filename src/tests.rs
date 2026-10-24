@@ -431,7 +431,7 @@ fn tone3000_gui_and_state() {
 fn engine_buffer_size_and_master_output() {
     use crate::engine::Engine;
     use std::time::{Duration, Instant};
-    let engine = Engine::new("studio-io-test");
+    let mut engine = Engine::new("studio-io-test");
     assert!(engine.is_running(), "{:?}", engine.error);
     let before = engine.buffer_size();
     let target = if before == 512 { 1024 } else { 512 };

@@ -1,5 +1,6 @@
 mod app;
 mod audio;
+mod backend;
 mod builtin;
 mod device;
 mod engine;
@@ -15,8 +16,10 @@ mod song;
 mod util;
 mod waveedit;
 
+#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 
+#[cfg(target_os = "linux")]
 const PW_JACK_DIRS: &[&str] = &[
     "/usr/lib/x86_64-linux-gnu/pipewire-0.3/jack",
     "/usr/lib/aarch64-linux-gnu/pipewire-0.3/jack",
@@ -34,6 +37,7 @@ Options:
 /// Behave like `pw-jack`: re-exec ourselves with PipeWire's libjack first in
 /// the library search path, so the JACK client is served by PipeWire even if
 /// the distribution's default libjack is the jackd2 one.
+#[cfg(target_os = "linux")]
 fn use_pipewire_jack() {
     if std::env::var_os("STUDIO_PW_JACK").is_some() {
         return; // already re-executed
@@ -78,6 +82,7 @@ fn main() -> eframe::Result {
         }
     }
     if !use_jackd {
+        #[cfg(target_os = "linux")]
         use_pipewire_jack();
     }
     lv2::setup_lv2_path();

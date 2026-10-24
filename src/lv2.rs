@@ -81,8 +81,7 @@ macro_rules! lilv_api {
         }
         impl Api {
             fn load() -> Result<Self, String> {
-                let lib = unsafe { Library::new("liblilv-0.so.0") }
-                    .map_err(|e| format!("could not load liblilv-0.so.0: {e}"))?;
+                let lib = unsafe { Library::new(LILV_LIB) }.map_err(|e| format!("could not load {LILV_LIB}: {e}"))?;
                 unsafe {
                     Ok(Api {
                         $($field: *lib
@@ -151,6 +150,13 @@ lilv_api! {
     file_uri_parse: fn(*const c_char, *mut *mut c_char) -> *mut c_char;
     free: fn(P);
 }
+
+#[cfg(windows)]
+const LILV_LIB: &str = "lilv-0.dll";
+#[cfg(target_os = "macos")]
+const LILV_LIB: &str = "liblilv-0.0.dylib";
+#[cfg(not(any(windows, target_os = "macos")))]
+const LILV_LIB: &str = "liblilv-0.so.0";
 
 static API: OnceLock<Result<Api, String>> = OnceLock::new();
 
@@ -1311,17 +1317,29 @@ pub fn setup_lv2_path() {
     if std::env::var_os("LV2_PATH").is_some() {
         return;
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let candidates = [
-        format!("{home}/.lv2"),
-        "/usr/local/lib/lv2".into(),
-        "/usr/lib/lv2".into(),
-        "/usr/local/lib64/lv2".into(),
-        "/usr/lib64/lv2".into(),
-        "/usr/lib/x86_64-linux-gnu/lv2".into(),
-        "/usr/lib/aarch64-linux-gnu/lv2".into(),
-    ];
+    #[cfg(windows)]
+    let (candidates, sep) = {
+        let env = |k: &str| std::env::var(k).unwrap_or_default();
+        (vec![format!("{}\\LV2", env("APPDATA")), format!("{}\\LV2", env("COMMONPROGRAMFILES"))], ";")
+    };
+    #[cfg(not(windows))]
+    let (candidates, sep) = {
+        let home = crate::util::home_dir();
+        let home = home.display();
+        (
+            vec![
+                format!("{home}/.lv2"),
+                "/usr/local/lib/lv2".into(),
+                "/usr/lib/lv2".into(),
+                "/usr/local/lib64/lv2".into(),
+                "/usr/lib64/lv2".into(),
+                "/usr/lib/x86_64-linux-gnu/lv2".into(),
+                "/usr/lib/aarch64-linux-gnu/lv2".into(),
+            ],
+            ":",
+        )
+    };
     let path: Vec<_> = candidates.into_iter().filter(|p| std::path::Path::new(p).is_dir()).collect();
     // SAFETY: called from main() before other threads exist.
-    unsafe { std::env::set_var("LV2_PATH", path.join(":")) };
+    unsafe { std::env::set_var("LV2_PATH", path.join(sep)) };
 }

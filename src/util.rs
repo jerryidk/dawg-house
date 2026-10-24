@@ -50,3 +50,12 @@ pub fn format_time(samples: i64, rate: u32) -> String {
     let s = secs - m as f64 * 60.0;
     format!("{m}:{s:06.3}")
 }
+
+/// The user's home directory (`HOME`, or `USERPROFILE` on Windows).
+pub fn home_dir() -> std::path::PathBuf {
+    #[cfg(windows)]
+    let var = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let var = std::env::var_os("HOME");
+    var.map(Into::into).unwrap_or_else(|| ".".into())
+}

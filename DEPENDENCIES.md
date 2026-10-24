@@ -80,9 +80,9 @@ Build: Rust 1.92 or newer (developed with 1.94).
 
 | Where | What | Notes |
 |---|---|---|
-| `main.rs` `use_pipewire_jack` | Re-exec with `LD_LIBRARY_PATH` (Unix `exec`) | PipeWire-only convenience; drop or replace per OS |
-| `engine.rs` `libjack_is_pipewire` | Reads `/proc/self/maps` | Status-bar label only |
-| `engine.rs` | Audio and MIDI I/O through JACK ports only | See "Cross-platform plan" below |
+| `main.rs` `use_pipewire_jack` | Re-exec with `LD_LIBRARY_PATH` (Unix `exec`) | Linux only (`cfg`) |
+| `backend/jack_backend.rs` | JACK client; reads `/proc/self/maps` to detect PipeWire | Linux only |
+| `backend/cpal_backend.rs` | WASAPI/ASIO and WinMM MIDI | Windows only |
 | `lv2.rs` | `liblilv-0.so.0`, default LV2 directories | Library name and paths differ per OS |
 | `lv2ui.rs` | `libX11.so.6`, `XInitThreads`, `ui:X11UI` only | macOS: `ui:CocoaUI`; Windows: `ui:WindowsUI`. GTK and Qt GUIs are not supported |
 | `export.rs` | `libmp3lame.so.0` | `libmp3lame.dylib` / `libmp3lame.dll` elsewhere |
@@ -94,9 +94,11 @@ Build: Rust 1.92 or newer (developed with 1.94).
 * **Flatpak:** use the freedesktop runtime with the PipeWire socket, and ship lilv and LAME.
 * **AppImage:** bundle lilv, serd, sord, sratom, zix and LAME. Keep libjack, libGL/EGL and libX11 from the host system: they must match the host's sound server and GPU driver.
 
-**macOS and Windows** need these changes, roughly in order:
-1. **Audio backend:** move the JACK-specific parts of `engine.rs` (port registration, port lookup, connections) behind an `AudioBackend` trait. Add a CoreAudio / WASAPI / ASIO backend (e.g. the `cpal` crate) next to JACK. The real-time mixer (`Processor`, `run_chain`, `mix_into`, `render_clips`) is already backend-independent, and offline export uses it without JACK.
-2. **Plugins:** LV2 is rare outside Linux. Add CLAP and/or VST3 hosts as new `Device` implementations (`device.rs` was designed for this), keeping LV2 on Linux.
-3. **Plugin GUIs:** use per-OS window embedding (Cocoa `NSView`, Win32 `HWND`) instead of the X11 code in `lv2ui.rs`.
-4. **Library names:** make the sonames in `lv2.rs`, `export.rs` and `lv2ui.rs` per-OS (`.so.N`, `.dylib`, `.dll`), or bundle the libraries.
-5. **The rest is portable already:** UI, project files, WAV I/O and file dialogs.
+**Windows:** ported on the `windows-port` branch; see [WINDOWS.md](WINDOWS.md). The engine runs on a `Backend` trait (`src/backend/`):
+* JACK on Linux;
+* cpal on Windows: WASAPI by default, ASIO with `--features asio`;
+* MIDI through midir.
+
+Windows-only crates: `cpal` (with the `realtime` feature for MMCSS) and `midir`; `jack` is Linux-only. Library names are per-OS: `lilv-0.dll`, `libmp3lame.dll`.
+
+**macOS:** add a CoreAudio backend through cpal (the `Backend` trait and `devio` layer are ready for it), set the `.dylib` names, and use CLAP/VST3/AU plugin hosting with Cocoa plugin GUIs.

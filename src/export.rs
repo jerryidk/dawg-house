@@ -184,7 +184,11 @@ struct Lame {
 impl Lame {
     fn load() -> Result<Self, String> {
         unsafe {
-            let lib = Library::new("libmp3lame.so.0").map_err(|_| "MP3 export needs libmp3lame (sudo apt install libmp3lame0)".to_string())?;
+            #[cfg(windows)]
+            let (name, hint) = ("libmp3lame.dll", "place libmp3lame.dll next to studio.exe");
+            #[cfg(not(windows))]
+            let (name, hint) = ("libmp3lame.so.0", "sudo apt install libmp3lame0");
+            let lib = Library::new(name).map_err(|_| format!("MP3 export needs {name} ({hint})"))?;
             macro_rules! sym {
                 ($name:literal) => {
                     *lib.get(concat!($name, "\0").as_bytes()).map_err(|e| format!("libmp3lame {}: {e}", $name))?

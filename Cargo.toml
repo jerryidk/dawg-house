@@ -20,7 +20,8 @@ serde_json = "1.0.154"
 jack = "0.13"
 
 [target.'cfg(windows)'.dependencies]
-cpal = "0.18"
+# realtime: MMCSS "Pro Audio" priority for the audio thread.
+cpal = { version = "0.18", features = ["realtime"] }
 midir = "0.11"
 
 [features]

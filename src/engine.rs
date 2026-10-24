@@ -226,6 +226,7 @@ impl Processor {
         (processor, ProcessorQueues { commands, garbage, midi_rec })
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn shared(&self) -> &EngineShared {
         &self.shared
     }

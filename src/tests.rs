@@ -19,6 +19,10 @@ fn run(reg: &DeviceRegistry, id: &str, midi: &[MidiEvent], input: f32) -> (Vec<f
 #[test]
 fn hosts_every_supported_lv2_effect() {
     let reg = registry();
+    if cfg!(not(target_os = "linux")) && reg.lv2_error().is_some() {
+        println!("no lilv on this platform, skipping: {:?}", reg.lv2_error());
+        return;
+    }
     assert!(reg.lv2_error().is_none(), "{:?}", reg.lv2_error());
     let lv2: Vec<_> = reg.devices.iter().filter(|d| d.id.starts_with("lv2:") && d.unsupported.is_none()).collect();
     println!("{} LV2 devices supported of {}", lv2.len(), reg.devices.iter().filter(|d| d.id.starts_with("lv2:")).count());
@@ -122,6 +126,7 @@ fn project_roundtrips_through_json() {
 
 /// Needs a running JACK server, e.g.
 /// `jackd -n studiotest -d dummy & JACK_DEFAULT_SERVER=studiotest cargo test -- --ignored`
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore]
 fn engine_end_to_end_with_jack() {
@@ -688,4 +693,127 @@ fn avl_drumkit_gui() {
     gui.close(&shared);
     stop.store(true, Ordering::Relaxed);
     drop(audio.join().unwrap());
+}
+
+/// The device-style I/O used by the Windows backend, driven without a driver:
+/// input-channel routing, MIDI fan-in, multi-channel output and the
+/// latency bound on queued input.
+#[test]
+fn device_runner_routes_inputs_midi_and_outputs() {
+    use crate::backend::TrackPorts;
+    use crate::backend::devio::{DeviceRunner, MidiInEvent};
+    use crate::engine::{Arrangement, Command, EngineShared, EngineTrack, Processor, TrackShared};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    let shared = Arc::new(EngineShared::default());
+    shared.master_gain.set(1.0);
+    let arrangement = Arc::new(arc_swap::ArcSwap::from_pointee(Arrangement::default()));
+    let (processor, mut q) = Processor::create(shared.clone(), arrangement);
+
+    // Audio track monitoring device input channel 2 (mono).
+    let audio = Arc::new(TrackShared::default());
+    audio.monitor.store(true, Ordering::Relaxed);
+    audio.in_channels[0].store(1, Ordering::Relaxed);
+    assert!(q.commands.push(Command::AddTrack(EngineTrack::new(1, TrackKind::Audio, audio.clone(), TrackPorts::Device))).is_ok());
+    // Instrument track with the built-in synth, listening to every MIDI port.
+    let inst = Arc::new(TrackShared::default());
+    inst.monitor.store(true, Ordering::Relaxed);
+    inst.midi_source.store(-2, Ordering::Relaxed);
+    assert!(q.commands.push(Command::AddTrack(EngineTrack::new(2, TrackKind::Instrument, inst.clone(), TrackPorts::Device))).is_ok());
+    let reg = registry();
+    let synth = reg.create("builtin:synth", 48000.0, DeviceShared::new(reg.get("builtin:synth").unwrap()), None).unwrap().device;
+    assert!(q.commands.push(Command::InsertDevice { track: 2, index: 0, device: synth }).is_ok());
+
+    let (mut in_tx, in_rx) = rtrb::RingBuffer::new(256 * 2 * 32);
+    let (mut midi_tx, midi_rx) = rtrb::RingBuffer::new(64);
+    let mut runner = DeviceRunner::new(processor, shared.clone(), 48000, midi_rx);
+    runner.set_input(Some((in_rx, 2)));
+
+    // 1. Channel 2 (0.5) reaches both master channels; ch 1 (0.1) is ignored;
+    //    outputs 3 and 4 of a 4-channel device stay silent.
+    for _ in 0..256 {
+        in_tx.push(0.1).unwrap();
+        in_tx.push(0.5).unwrap();
+    }
+    let mut out = vec![9.0f32; 256 * 4];
+    runner.render(&mut out, 4);
+    for f in out.chunks(4) {
+        assert_eq!(f, [0.5, 0.5, 0.0, 0.0]);
+    }
+    assert_eq!(shared.buffer_size.load(Ordering::Relaxed), 256);
+
+    // 2. A note from MIDI port 0 plays the synth (instrument listens to all ports).
+    audio.monitor.store(false, Ordering::Relaxed);
+    midi_tx.push(MidiInEvent::new(0, &[0x90, 60, 110]).unwrap()).unwrap();
+    let mut peak = 0f32;
+    for _ in 0..8 {
+        let mut out = vec![0.0f32; 256 * 2];
+        runner.render(&mut out, 2);
+        peak = out.iter().fold(peak, |m, s| m.max(s.abs()));
+    }
+    assert!(peak > 0.01, "synth should play the MIDI note, peak {peak}");
+    assert!(inst.midi_activity.load(Ordering::Relaxed));
+
+    // 3. Queued input beyond four blocks is dropped (bounded latency).
+    for _ in 0..256 * 20 {
+        let _ = in_tx.push(0.0);
+        let _ = in_tx.push(0.0);
+    }
+    let mut out = vec![0.0f32; 256 * 2];
+    runner.render(&mut out, 2);
+    assert!(in_tx.slots() >= in_tx.buffer().capacity() - 256 * 2 * 4, "queued input should be capped at 4 blocks");
+
+    // SysEx is not a short message.
+    assert!(MidiInEvent::new(0, &[0xF0, 1, 2, 3, 0xF7]).is_none());
+}
+
+/// The Windows audio backend (cpal: WASAPI, or ASIO with the `asio` feature)
+/// end to end: the built-in synth plays a MIDI clip through the device. Under
+/// Wine on Linux, WASAPI goes through winepulse to PipeWire/PulseAudio:
+///   WINEDEBUG=-all cargo test --target x86_64-pc-windows-gnu wasapi -- --ignored --nocapture
+#[cfg(windows)]
+#[test]
+#[ignore]
+fn windows_backend_plays_the_synth() {
+    use crate::engine::{Arrangement, Command, Engine, PlayClip, PlayContent, TrackShared};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let mut engine = Engine::new("studio-windows-test");
+    assert!(engine.is_running(), "{:?}", engine.error);
+    println!("backend: {} at {} Hz", engine.backend_name(), engine.sample_rate);
+    let reg = registry();
+    let inst = Arc::new(TrackShared::default());
+    engine.add_track(1, TrackKind::Instrument, inst.clone()).unwrap();
+    let info = reg.get("builtin:synth").unwrap();
+    let device = reg.create(&info.id, engine.sample_rate as f64, DeviceShared::new(info), None).unwrap().device;
+    engine.send(Command::InsertDevice { track: 1, index: 0, device });
+    let events = vec![(0u64, [0x90, 57, 110]), (engine.sample_rate as u64, [0x80, 57, 0])];
+    engine.set_arrangement(Arrangement {
+        tracks: vec![(1, vec![PlayClip { start: 0, length: engine.sample_rate as usize * 2, gain: 1.0, fade_in: 0, fade_out: 0, content: PlayContent::Midi { events: Arc::new(events) } }])],
+    });
+    engine.send(Command::Play);
+    let t0 = Instant::now();
+    let mut peak = 0f32;
+    while t0.elapsed() < Duration::from_millis(800) {
+        peak = peak.max(engine.shared.master_peak[0].take());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    engine.send(Command::Stop);
+    let devices = engine.playback_devices();
+    println!(
+        "peak {peak:.3}, period {} frames, DSP {:.1}%, xruns {}, position {}, devices {:?}, buffer sizes {:?}",
+        engine.buffer_size(),
+        engine.cpu_load(),
+        engine.shared.xruns.load(Ordering::Relaxed),
+        engine.shared.position.load(Ordering::Relaxed),
+        devices.iter().map(|d| &d.0).collect::<Vec<_>>(),
+        engine.buffer_sizes()
+    );
+    assert!(engine.buffer_size() > 0, "the device callback never ran");
+    assert!(engine.shared.position.load(Ordering::Relaxed) > 0, "transport did not advance");
+    assert!(peak > 0.01, "the synth should be audible on the master");
+    assert!(!devices.is_empty());
 }

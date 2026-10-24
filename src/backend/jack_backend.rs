@@ -134,7 +134,7 @@ impl Backend for JackBackend {
     }
 
     fn sample_rate(&self) -> u32 {
-        self.client().sample_rate() as u32
+        self.client().sample_rate()
     }
 
     fn cpu_load(&self) -> f32 {

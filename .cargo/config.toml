@@ -1,2 +1,9 @@
 [env]
 PKG_CONFIG_PATH = { value = "build-support/pkgconfig", relative = true }
+
+# Windows build from Linux: link with mingw-w64, run binaries/tests with Wine.
+#   cargo build --target x86_64-pc-windows-gnu
+#   WINEDEBUG=-all cargo test --target x86_64-pc-windows-gnu
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+runner = "wine"

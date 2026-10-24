@@ -281,7 +281,7 @@ impl Default for Project {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let home = crate::util::home_dir();
         Project {
             version: 1,
             tracks: vec![],
@@ -290,7 +290,7 @@ impl Default for Project {
             bpm: 120.0,
             snap: true,
             master_db: 0.0,
-            audio_dir: PathBuf::from(home).join("Music/Studio").join(format!("session-{stamp}")).join("audio"),
+            audio_dir: home.join("Music").join("Studio").join(format!("session-{stamp}")).join("audio"),
             master_output: None,
         }
     }

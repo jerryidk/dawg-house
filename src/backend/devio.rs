@@ -121,6 +121,10 @@ impl DeviceRunner {
         self.input_started = false;
     }
 
+    pub fn shared(&self) -> &EngineShared {
+        &self.shared
+    }
+
     pub fn set_rate(&mut self, rate: u32) {
         self.rate = rate;
         self.processor.set_sample_rate(rate as f64);

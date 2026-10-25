@@ -281,7 +281,54 @@ fn tone3000_gui_from_app_and_state_roundtrip() {
     h.run_steps(2);
     assert_eq!(h.state().gui.open_count(), 0, "GUIs close when the project is replaced");
     let slot = &h.state().project.track(track).unwrap().devices[0];
-    assert!(slot.lv2.is_some() && slot.state.as_ref().is_some_and(|s| !s.is_empty()));
+    assert!(slot.link.is_some() && slot.state.as_ref().is_some_and(|s| !s.is_empty()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A VST3 plugin (TONE3000) from the app: editor from the device panel,
+/// parameter and plugin state saved in the project and restored on open.
+///   DISPLAY=:0 cargo test vst3_from_app -- --ignored --nocapture
+#[test]
+#[ignore]
+fn vst3_from_app_editor_and_project_state() {
+    use crate::device::PluginLink;
+    crate::lv2ui::init_x11();
+    let mut h = harness();
+    let id = h.state().registry.devices.iter().find(|d| d.id.starts_with("vst3:") && d.name == "TONE3000").expect("TONE3000.vst3 is not installed").id.clone();
+    let track = h.state().project.tracks[0].id;
+    h.state_mut().add_device(track, &id);
+    h.state_mut().sel.track = Some(track);
+    h.state_mut().bottom = BottomTab::Devices;
+    h.run_steps(3);
+    h.get_by_label(&format!("{} Open GUI", egui_phosphor::regular::APP_WINDOW)).click();
+    h.run_steps(2);
+    let link = |h: &Harness<'_, StudioApp>| match &h.state().project.track(track).unwrap().devices[0].link {
+        Some(PluginLink::Vst3(l)) => l.clone(),
+        _ => panic!("expected a VST3 device"),
+    };
+    assert!(link(&h).editor_open(), "the editor should be open");
+
+    // Turn a knob from Studio's side; the plugin's GUI follows (plugin thread).
+    let shared = h.state().project.track(track).unwrap().devices[0].shared.clone().unwrap();
+    shared.params[0].set(0.9);
+    for _ in 0..30 {
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(16));
+    }
+
+    let dir = std::env::temp_dir().join(format!("studio-vst3-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("p.studio");
+    h.state_mut().save_project_to(path.clone());
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("vst3:component"), "plugin state missing from project file");
+    let old = link(&h);
+    h.state_mut().open_project(path);
+    h.run_steps(2);
+    assert!(!old.editor_open(), "editors close when the project is replaced");
+    let slot = &h.state().project.track(track).unwrap().devices[0];
+    let value = slot.shared.as_ref().unwrap().params[0].get();
+    assert!((value - 0.9).abs() < 0.02, "restored {value}");
     let _ = std::fs::remove_dir_all(dir);
 }
 

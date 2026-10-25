@@ -2,12 +2,12 @@
 //!
 //! Everything that sits in a track's chain — LV2 plugins, built-in
 //! instruments and effects — implements [`Device`]. The engine only knows
-//! about this trait, so new device kinds (CLAP, built-in modulators, ...) can
-//! be added by implementing it and registering a factory in
-//! [`DeviceRegistry`].
+//! about this trait, so new device kinds (LV2, VST3, built-in, ...) are added
+//! by implementing it and registering a factory in [`DeviceRegistry`].
 
 use crate::builtin;
 use crate::lv2::{Lv2Host, Lv2Link, StateEntry};
+use crate::vst3::{Vst3Host, Vst3Link};
 use crate::util::AtomicF32;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -93,7 +93,8 @@ impl ParamInfo {
 /// Static description of a device type, used by the browser and the UI.
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
-    /// Stable identifier saved in projects: `lv2:<uri>` or `builtin:<name>`.
+    /// Stable identifier saved in projects: `lv2:<uri>`, `vst3:<class id>`
+    /// or `builtin:<name>`.
     pub id: String,
     pub name: String,
     pub category: DeviceCategory,
@@ -128,14 +129,22 @@ impl DeviceShared {
 pub struct DeviceRegistry {
     pub devices: Vec<DeviceInfo>,
     lv2: Lv2Host,
+    vst3: Vst3Host,
 }
 
 impl DeviceRegistry {
     pub fn new(sample_rate: f32) -> Self {
         let lv2 = Lv2Host::new(sample_rate);
+        let vst3 = Vst3Host::new();
         let mut devices = builtin::catalogue();
         devices.extend(lv2.plugins.iter().map(|p| p.info.clone()));
-        DeviceRegistry { devices, lv2 }
+        devices.extend(vst3.classes.iter().map(crate::vst3::device_info));
+        DeviceRegistry { devices, lv2, vst3 }
+    }
+
+    /// VST3 modules that could not be loaded: (path, why).
+    pub fn vst3_failures(&self) -> &[(std::path::PathBuf, String)] {
+        &self.vst3.failures
     }
 
     pub fn lv2_error(&self) -> Option<&str> {
@@ -151,20 +160,50 @@ impl DeviceRegistry {
     pub fn create(&self, id: &str, sample_rate: f64, shared: Arc<DeviceShared>, state: Option<&[StateEntry]>) -> Result<Created, String> {
         if let Some(name) = id.strip_prefix("builtin:") {
             let device = builtin::create(name, sample_rate as f32, shared).ok_or_else(|| format!("unknown device {id}"))?;
-            return Ok(Created { device, lv2: None });
+            return Ok(Created { device, link: None });
         }
         if let Some(uri) = id.strip_prefix("lv2:") {
             let idx = self.lv2.find(uri).ok_or_else(|| format!("LV2 plugin not installed: {uri}"))?;
             let (runtime, link) = self.lv2.instantiate(idx, sample_rate, shared, state)?;
-            return Ok(Created { device: Box::new(runtime), lv2: Some(link) });
+            return Ok(Created { device: Box::new(runtime), link: Some(PluginLink::Lv2(link)) });
+        }
+        if let Some(cid) = id.strip_prefix("vst3:") {
+            let (device, link) = self.vst3.instantiate(cid, sample_rate, shared, state)?;
+            return Ok(Created { device: Box::new(device), link: Some(PluginLink::Vst3(link)) });
         }
         Err(format!("unknown device {id}"))
     }
 }
 
-/// A freshly created device. LV2 plugins also return a link used for their
-/// GUI and state, which stays on the UI thread.
+/// A freshly created device. Plugins also return a link used for their GUI
+/// and state, which stays on the UI thread.
 pub struct Created {
     pub device: Box<dyn Device>,
-    pub lv2: Option<Arc<Lv2Link>>,
+    pub link: Option<PluginLink>,
+}
+
+/// The UI thread's handle on a running plugin.
+#[derive(Clone)]
+pub enum PluginLink {
+    Lv2(Arc<Lv2Link>),
+    Vst3(Arc<Vst3Link>),
+}
+
+impl PluginLink {
+    /// The LV2 link, if this is an LV2 plugin.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn lv2(&self) -> Option<&Arc<Lv2Link>> {
+        match self {
+            PluginLink::Lv2(l) => Some(l),
+            PluginLink::Vst3(_) => None,
+        }
+    }
+
+    /// The plugin's current internal state, to save with the project.
+    pub fn save_state(&self) -> Option<Vec<StateEntry>> {
+        match self {
+            PluginLink::Lv2(l) => crate::lv2::save_state(l),
+            PluginLink::Vst3(v) => v.save_state(),
+        }
+    }
 }

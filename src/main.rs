@@ -104,6 +104,7 @@ fn main() -> eframe::Result {
 
 #[cfg(kani)]
 mod verification;
+mod vst3;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

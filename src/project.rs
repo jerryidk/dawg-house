@@ -197,7 +197,8 @@ impl Clip {
 }
 
 /// A device in a track's chain. `device_id` identifies the device type in
-/// the [`crate::device::DeviceRegistry`] (`lv2:<uri>` or `builtin:<name>`).
+/// the [`crate::device::DeviceRegistry`] (`lv2:<uri>`, `vst3:<class id>` or
+/// `builtin:<name>`).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DeviceSlot {
     pub device_id: String,
@@ -210,9 +211,9 @@ pub struct DeviceSlot {
     /// Plugin-internal state (e.g. a loaded amp model), refreshed before saving.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<Vec<crate::lv2::StateEntry>>,
-    /// Link to the running LV2 instance (GUI hosting, state saving).
+    /// Link to the running plugin instance (GUI hosting, state saving).
     #[serde(skip)]
-    pub lv2: Option<Arc<crate::lv2::Lv2Link>>,
+    pub link: Option<crate::device::PluginLink>,
 }
 
 #[derive(Serialize, Deserialize)]

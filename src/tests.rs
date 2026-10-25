@@ -382,7 +382,7 @@ fn tone3000_gui_and_state() {
     assert!(info.has_gui, "TONE3000 GUI not discovered");
     let shared = DeviceShared::new(&info);
     let created = reg.create(id, 48000.0, shared.clone(), None).unwrap();
-    let link = created.lv2.clone().unwrap();
+    let link = created.link.as_ref().and_then(|l| l.lv2()).cloned().unwrap();
 
     // Simulated audio thread running the plugin.
     let stop = Arc::new(AtomicBool::new(false));
@@ -425,7 +425,7 @@ fn tone3000_gui_and_state() {
 
     // Restore the saved state into a fresh instance.
     let again = reg.create(id, 48000.0, DeviceShared::new(&info), Some(&state)).unwrap();
-    let state2 = crate::lv2::save_state(again.lv2.as_ref().unwrap()).unwrap();
+    let state2 = crate::lv2::save_state(again.link.as_ref().and_then(|l| l.lv2()).unwrap()).unwrap();
     assert_eq!(state.len(), state2.len());
     println!("state restored into a new instance ({} entries)", state2.len());
 }
@@ -517,7 +517,7 @@ fn x42_tuner_gui_with_egl_context_current() {
     assert!(info.has_gui);
     let shared = DeviceShared::new(&info);
     let created = reg.create(id, 48000.0, shared.clone(), None).unwrap();
-    let link = created.lv2.unwrap();
+    let link = created.link.as_ref().and_then(|l| l.lv2()).cloned().unwrap();
     assert!(make_egl_context_current(), "could not make an EGL context current");
 
     // 1. Through the GUI thread: opens and keeps running without X errors.
@@ -662,7 +662,7 @@ fn avl_drumkit_gui() {
     assert!(info.has_gui);
     let shared = DeviceShared::new(&info);
     let created = reg.create(id, 48000.0, shared.clone(), None).unwrap();
-    let link = created.lv2.unwrap();
+    let link = created.link.as_ref().and_then(|l| l.lv2()).cloned().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
     let mut dev = created.device;
@@ -962,4 +962,109 @@ fn wasapi_modes_rates_and_inputs() {
     if let Some(appdata) = std::env::var_os("APPDATA") {
         let _ = std::fs::remove_file(std::path::Path::new(&appdata).join("Studio").join("audio.json"));
     }
+}
+
+/// VST3 hosting with an installed plugin: TONE3000 (a JUCE amp simulator,
+/// ~/.vst3/TONE3000.vst3). Scans, processes audio, sends a parameter change
+/// to the processor and restores it from saved state in a new instance.
+///   cargo test vst3_tone3000 -- --ignored --nocapture
+#[test]
+#[ignore]
+fn vst3_tone3000_processes_and_keeps_state() {
+    use crate::device::{PluginLink, ProcessContext};
+    let reg = crate::device::DeviceRegistry::new(48000.0);
+    let info = reg.devices.iter().find(|d| d.id.starts_with("vst3:") && d.name == "TONE3000").expect("TONE3000.vst3 is not installed").clone();
+    assert!(info.unsupported.is_none(), "{:?}", info.unsupported);
+    println!("{} ({}): {} params, {} outputs, GUI {}", info.name, info.class, info.params.len(), info.outputs.len(), info.has_gui);
+    for p in info.params.iter().take(8) {
+        println!("  {} = {} [{}..{}]{}", p.name, p.default, p.min, p.max, if p.integer { " steps" } else { "" });
+    }
+    let shared = DeviceShared::new(&info);
+    let created = reg.create(&info.id, 48000.0, shared.clone(), None).unwrap();
+    let Some(PluginLink::Vst3(link)) = created.link else { panic!("expected a VST3 link") };
+    let mut dev = created.device;
+
+    // A 220 Hz sine through the plugin.
+    let block = 256;
+    let mut peak_out = 0f32;
+    let mut t = 0usize;
+    for _ in 0..200 {
+        let mut l: Vec<f32> = (0..block).map(|i| 0.3 * (2.0 * std::f32::consts::PI * 220.0 * (t + i) as f32 / 48000.0).sin()).collect();
+        let mut r = l.clone();
+        t += block;
+        dev.process(&mut ProcessContext { left: &mut l, right: &mut r, midi: &[] });
+        assert!(l.iter().chain(&r).all(|s| s.is_finite()));
+        peak_out = l.iter().fold(peak_out, |m, s| m.max(s.abs()));
+    }
+    println!("output peak {peak_out:.3}");
+
+    // Change the first continuous parameter, let the processor take it, save.
+    let (idx, p) = info.params.iter().enumerate().find(|(_, p)| !p.integer).expect("a continuous parameter");
+    let target = if p.default > 0.5 { 0.2 } else { 0.8 };
+    shared.params[idx].set(target);
+    for _ in 0..4 {
+        let (mut l, mut r) = (vec![0.0; block], vec![0.0; block]);
+        dev.process(&mut ProcessContext { left: &mut l, right: &mut r, midi: &[] });
+    }
+    let state = link.save_state().expect("state");
+    let component = state.iter().find(|e| e.key == "vst3:component").expect("component state");
+    println!("state: {} entries, component {} bytes; set '{}' to {target}", state.len(), component.value.len(), p.name);
+    assert!(!component.value.is_empty());
+    drop(dev);
+
+    // A new instance from that state starts with the changed value.
+    let shared2 = DeviceShared::new(&info);
+    let created2 = reg.create(&info.id, 48000.0, shared2.clone(), Some(&state)).unwrap();
+    let restored = shared2.params[idx].get();
+    println!("restored '{}' = {restored}", p.name);
+    assert!((restored - target).abs() < 0.02, "expected {target}, got {restored}");
+    drop(created2);
+}
+
+/// The plugin's own editor in an X11 window (needs a display).
+///   cargo test vst3_tone3000_editor -- --ignored --nocapture
+#[test]
+#[ignore]
+fn vst3_tone3000_editor() {
+    use crate::device::PluginLink;
+    let reg = crate::device::DeviceRegistry::new(48000.0);
+    let info = reg.devices.iter().find(|d| d.id.starts_with("vst3:") && d.name == "TONE3000").expect("TONE3000.vst3 is not installed").clone();
+    assert!(info.has_gui);
+    let created = reg.create(&info.id, 48000.0, DeviceShared::new(&info), None).unwrap();
+    let Some(PluginLink::Vst3(link)) = created.link else { panic!("expected a VST3 link") };
+    link.open_editor("TONE3000 - test".into()).unwrap();
+    assert!(link.editor_open());
+    let secs = std::env::var("STUDIO_EDITOR_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    link.close_editor();
+    assert!(!link.editor_open());
+    drop(created.device);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+}
+
+/// VST3 hosting against the `vst3` crate's example gain plugin, built for
+/// the target and found through `VST3_PATH` (works natively and under Wine):
+///   VST3_PATH=<dir with Gain.vst3> cargo test vst3_gain -- --ignored --nocapture
+#[test]
+#[ignore]
+fn vst3_gain_plugin_scales_audio() {
+    use crate::device::ProcessContext;
+    let reg = crate::device::DeviceRegistry::new(48000.0);
+    for (p, e) in reg.vst3_failures() {
+        println!("failed: {}: {e}", p.display());
+    }
+    let info = reg.devices.iter().find(|d| d.id.starts_with("vst3:") && d.name.contains("Gain")).expect("Gain.vst3 not found via VST3_PATH").clone();
+    println!("{} ({}) params {:?}", info.name, info.id, info.params.iter().map(|p| (&p.name, p.default)).collect::<Vec<_>>());
+    let shared = DeviceShared::new(&info);
+    let mut dev = reg.create(&info.id, 48000.0, shared.clone(), None).unwrap().device;
+    let run = |dev: &mut Box<dyn crate::device::Device>| {
+        let (mut l, mut r) = (vec![0.5f32; 128], vec![-0.25f32; 128]);
+        dev.process(&mut ProcessContext { left: &mut l, right: &mut r, midi: &[] });
+        (l[64], r[64])
+    };
+    assert_eq!(run(&mut dev), (0.5, -0.25), "unity gain by default");
+    shared.params[0].set(0.5);
+    assert_eq!(run(&mut dev), (0.25, -0.125), "the parameter change reaches the processor");
+    shared.bypass.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(run(&mut dev), (0.5, -0.25), "bypass passes audio through");
 }

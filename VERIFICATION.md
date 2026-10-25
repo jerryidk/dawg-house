@@ -28,7 +28,9 @@ The proofs live in `src/verification.rs` and are only compiled under `cfg(kani)`
 | `frames_reject_oversized` | `frames::push` (`write_chunk_uninit` + `commit_all`) | A message larger than the free space is rejected whole; nothing is committed |
 | `gui_control_value_any_pointer` | `lv2ui::decode_control`: pointer **from a plugin GUI** | Any address and size: no UB, value read only when present |
 | `state_retrieve_any_key` | `lv2::retrieve_cb`: called **by plugins** during state restore | Returns exactly the stored value; null out-pointers are tolerated |
-| `device_input_routing_any_channel` | `devio::DeviceIo::track_audio`: channel indices from atomics | Any `i32` channel selects valid buffers of the cycle's length, or none |
+| `device_input_routing_any_channel` | `devio::DeviceIo::track_audio`: channel indices from atomics | Any `i32` channel id (device × 64 + channel, several input devices) selects valid buffers of the cycle's length, or none |
+| `vst3_stream_any_seek_read_write` | `vst3::com::MemStream` (`IBStream` handed to plugins for state) | Any seek mode, seeks near the data, any read/write size stay in bounds; growth stops at the write's end (huge seeks are refused, unit-tested) |
+| `vst3_param_changes_any_use` | `vst3::com::ParamChanges` (`IParameterChanges` handed to processors) | Any ids, indices and points stay inside the preallocated queue pool |
 | `device_deinterleave_any_channel_count` | `devio::deinterleave`: channel count **from the driver** | No out-of-bounds access for 0–2 channels and any wrap split |
 | `audio_sample_any_shape` | `AudioData::sample` (audio thread) | Never panics for any channel count or index |
 | `midi_messages_any_length` | `MidiInEvent::new`, `MidiEvent::new`: bytes **from MIDI drivers** | No panic for any length; only 1–3 byte messages are accepted |

@@ -121,6 +121,12 @@ impl CycleIo for DeviceIo<'_> {
 }
 
 impl InputState {
+    /// Channel buffers of `block` frames for one input device.
+    pub(crate) fn new(input: DeviceInput, block: usize) -> Self {
+        let channels = input.channels.max(1);
+        InputState { device: input.device, channels, rx: input.rx, bufs: vec![vec![0.0; block]; channels], started: false }
+    }
+
     /// Fill the channel buffers with `n` frames; true on an underrun.
     fn pull(&mut self, n: usize) -> bool {
         let ch = self.channels;
@@ -183,10 +189,7 @@ impl DeviceRunner {
     /// Replace the capture streams. Allocates: call it holding the runner's
     /// lock (the output callback then renders silence for a moment).
     pub fn set_inputs(&mut self, inputs: Vec<DeviceInput>) {
-        self.inputs = inputs
-            .into_iter()
-            .map(|i| InputState { device: i.device, channels: i.channels.max(1), rx: i.rx, bufs: vec![vec![0.0; MAX_BLOCK]; i.channels.max(1)], started: false })
-            .collect();
+        self.inputs = inputs.into_iter().map(|i| InputState::new(i, MAX_BLOCK)).collect();
     }
 
     /// Input devices currently attached.

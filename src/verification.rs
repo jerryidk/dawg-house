@@ -181,12 +181,15 @@ fn state_retrieve_any_key() {
 #[kani::proof]
 #[kani::unwind(5)]
 fn device_input_routing_any_channel() {
-    use crate::backend::{CycleIo, TrackPorts, devio::DeviceIo};
+    use crate::backend::devio::{DeviceInput, DeviceIo, InputState};
+    use crate::backend::{CycleIo, TrackPorts};
     use std::sync::atomic::Ordering;
     let shared = crate::engine::TrackShared::default();
     shared.in_channels[0].store(kani::any(), Ordering::Relaxed);
     shared.in_channels[1].store(kani::any(), Ordering::Relaxed);
-    let inputs = vec![vec![0.0f32; 4], vec![1.0f32; 4], vec![2.0f32; 4]];
+    // Two open input devices (0: stereo, 3: mono); any id may name others.
+    let input = |device, channels| InputState::new(DeviceInput { device, channels, rx: rtrb::RingBuffer::new(1).1 }, 4);
+    let inputs = [input(0, 2), input(3, 1)];
     let frames: usize = kani::any();
     kani::assume(frames <= 4);
     let (mut l, mut r) = ([0f32; 4], [0f32; 4]);
@@ -278,4 +281,59 @@ fn render_clip_any_placement() {
     kani::assume(n <= 2);
     let mut events = Vec::new();
     crate::engine::render_clips(std::slice::from_ref(&clip), pos, &mut l[..n], &mut r2[..n], &mut events, 0);
+}
+
+/// A VST3 plugin's state stream: any seek mode, a seek near the data and
+/// any read or write size stay in bounds. (Seeks far past the end, which
+/// must not make Studio allocate, are covered by a unit test: the growth
+/// loop cannot be unrolled for them.)
+#[kani::proof]
+#[kani::unwind(17)]
+fn vst3_stream_any_seek_read_write() {
+    use crate::vst3::com::MemStream;
+    use vst3::Steinberg::IBStreamTrait;
+    let s = MemStream::new(vec![1, 2, 3]);
+    let (pos, mode): (i64, i32) = (kani::any(), kani::any());
+    kani::assume((-8..=8).contains(&pos));
+    let mut result = 0i64;
+    unsafe { s.seek(pos, mode, &mut result) };
+    let mut buf = [0u8; 4];
+    let n: i32 = kani::any();
+    kani::assume(n <= 4);
+    let mut done = -1;
+    if kani::any() {
+        unsafe { s.read(buf.as_mut_ptr().cast(), n, &mut done) };
+        assert!(done <= n.max(0));
+    } else {
+        unsafe { s.write(buf.as_mut_ptr().cast(), n, &mut done) };
+        // Seek ≤ end (3) + 8, then at most 4 bytes.
+        assert!(s.bytes().len() <= 3 + 8 + 4, "grows only to the write's end");
+    }
+}
+
+/// Per-block parameter changes as plugins use them: any ids, indices and
+/// point counts stay inside the preallocated pool.
+#[kani::proof]
+#[kani::unwind(17)] // COM interface lookup compares 16-byte GUIDs
+fn vst3_param_changes_any_use() {
+    use crate::vst3::com::ParamChanges;
+    use vst3::Steinberg::Vst::{IParamValueQueueTrait, IParameterChangesTrait};
+    let pc = ParamChanges::new(1);
+    for _ in 0..2 {
+        let id: u32 = kani::any();
+        let mut index = -1;
+        let q = unsafe { pc.addParameterData(&id, &mut index) };
+        assert!(q.is_null() || index == 0);
+        if let Some(q) = unsafe { vst3::ComRef::from_raw(q) } {
+            let mut at = -1;
+            unsafe { q.addPoint(kani::any(), kani::any(), &mut at) };
+        }
+    }
+    let i: i32 = kani::any();
+    let q = unsafe { pc.getParameterData(i) };
+    assert!(q.is_null() || (0..unsafe { pc.getParameterCount() }).contains(&i));
+    if let Some(q) = unsafe { vst3::ComRef::from_raw(q) } {
+        let (mut offset, mut value) = (0, 0.0);
+        unsafe { q.getPoint(kani::any(), &mut offset, &mut value) };
+    }
 }

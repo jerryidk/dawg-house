@@ -2,7 +2,7 @@
 
 A recording studio / DAW for Linux built around **recording by pieces**. Each track (one instrument layer: guitar, bass, drums, vocals…) owns **snippets**: short pieces with their own tempo, meter and length in bars. You record into a snippet as many times as you like, and every loop pass becomes a **take**. Then you assemble the song on a linear timeline from **linked placements** of those snippets. To fix a mistake, re-record one snippet and every place it's used updates.
 
-Studio also has non-destructive editing, audio and instrument (MIDI) tracks, and LV2 plugins. It runs on PipeWire through its JACK emulation.
+Studio also has non-destructive editing, audio and instrument (MIDI) tracks, and LV2 and VST3 plugins. It runs on PipeWire through its JACK emulation on Linux, and on WASAPI (or ASIO) on Windows.
 
 ## Build and run
 
@@ -38,8 +38,9 @@ The window has three foldable panels: **Snippets** (one column per track), **Tim
 * **Recording on the timeline:** with the song playing, arm tracks and press **R** to record free clips at the playhead. Audio is written as 32-bit float WAV to `~/Music/Studio/session-*/audio/`. MIDI becomes a MIDI clip.
 * **Editing:** drag a clip to move it (also between tracks of the same kind), drag its edges to trim, and drag the top handles of audio clips for fades. **S** splits at the playhead, **Ctrl+D** duplicates, **Del** deletes, **Ctrl+Z / Ctrl+Shift+Z** undo and redo. Snap follows the visible grid; hold **Alt** to bypass it.
 * **Piano roll:** double-click an instrument lane to create a MIDI clip. In the **Editor** tab, click to add a note, drag to move, drag the right edge to resize, and right-click to delete. Drag in the velocity lane to set velocity. **Q** quantizes.
-* **Instruments:** instrument tracks play MIDI into their first device: the built-in synth, or an LV2 instrument such as the AVL drum kits (e.g. *Black Pearl Drumkit*). **Change instrument** in the Devices tab swaps it. Drum kits load their samples in the background (LV2 worker extension). *Multi* kits are mixed down to stereo using the plugin's own left/right port markings.
-* **Devices:** in the **Devices** tab, add LV2 or built-in devices, bypass, reorder and remove them, and edit their parameters. Plugins that ship their own interface (e.g. TONE3000) have an **Open GUI** button, which opens it in a separate window (X11; XWayland on Wayland desktops). A plugin's internal state, such as a loaded amp model, is saved in the project.
+* **Instruments:** instrument tracks play MIDI into their first device: the built-in synth, or an LV2 or VST3 instrument such as the AVL drum kits (e.g. *Black Pearl Drumkit*). **Change instrument** in the Devices tab swaps it. Drum kits load their samples in the background (LV2 worker extension). *Multi* kits are mixed down to stereo using the plugin's own left/right port markings.
+* **Devices:** in the **Devices** tab, add LV2, VST3 or built-in devices, bypass, reorder and remove them, and edit their parameters. Plugins that ship their own interface (e.g. TONE3000) have an **Open GUI** button, which opens it in a separate window (X11 on Linux, XWayland on Wayland desktops; a native window on Windows). A plugin's internal state, such as a loaded amp model, is saved in the project.
+* **VST3:** plugins are found in `~/.vst3`, `/usr/lib/vst3`, `/usr/local/lib/vst3` (Linux), `%COMMONPROGRAMFILES%\VST3` and `%LOCALAPPDATA%\Programs\Common\VST3` (Windows), plus any folders in `VST3_PATH`. Each module is loaded once to list its plugins and parameters; the result is cached (`~/.cache/studio/vst3-cache.json`, `%LOCALAPPDATA%\Studio\vst3-cache.json`), so later starts only load new or changed modules. MIDI CC, aftertouch and pitch bend reach the plugin's parameters through its MIDI mapping.
 * **Editor tab:** timeline clips and snippet takes use the same editors. MIDI opens in the piano roll and audio in the **waveform editor**. The editor shows the selected clip, the selected snippet's active take, or a take opened with **Edit** in the Takes tab. The waveform editor draws the audio against the region's own bars and beats (the snippet's tempo and meter for takes). Zoom with Ctrl+wheel, −/+ or Fit. Drag the audio to slip it against the grid (snapped; hold Alt for free movement), drag the edges to trim timeline clips, drag the top corners for fades, and set gain. A take's gain and fades apply on every loop pass.
 * **Navigation:** Space play/pause, Home to the start, Ctrl+wheel zoom, Shift+wheel scroll. Click the ruler to move the playhead.
 * **Files:** save and open projects (`.studio`, JSON) and import WAV files (Ctrl+I, or drop them on a lane).
@@ -55,6 +56,8 @@ src/
   builtin.rs    built-in devices (Basic Synth, Utility)
   lv2.rs        LV2 host on liblilv (dlopen): discovery, URID map, options, worker, MIDI→atom, state, multi-out downmix
   lv2ui.rs      plugin GUI windows (X11UI via dlopen'd libX11, instance-access, idle/resize)
+  vst3/         VST3 host: plugin thread, scanning + cache, instances, Device, editor windows (X11/Win32, run loop)
+  backend/      audio drivers: JACK (Linux), WASAPI and ASIO (Windows), devio (device-style I/O)
   engine.rs     JACK real-time engine: tracks, device chains, clip playback, recording
   audio.rs      audio sources, WAV import/resampling, disk-writer for recording
   project.rs    model: TrackKind, Snippet, Take, Clip, ClipContent, Note, DeviceSlot, undo history
@@ -68,7 +71,7 @@ src/
   theme.rs      visual style and small widgets
 ```
 
-* **Device trait** (`device.rs`): everything in a track's chain implements `Device::process(&mut ProcessContext)`, which gets stereo audio in place plus sorted MIDI events. LV2 plugins and built-ins use the same trait, parameter model (`DeviceShared` atomics) and generic UI. To add a new kind (for example CLAP), implement `Device` and give it an id prefix in `DeviceRegistry::create`.
+* **Device trait** (`device.rs`): everything in a track's chain implements `Device::process(&mut ProcessContext)`, which gets stereo audio in place plus sorted MIDI events. LV2 and VST3 plugins and built-ins use the same trait, parameter model (`DeviceShared` atomics) and generic UI. To add a new kind (for example CLAP), implement `Device` and give it an id prefix in `DeviceRegistry::create`.
 * **Track kinds** (`project::TrackKind`): `Audio` (JACK audio inputs, recording to WAV) and `Instrument` (JACK MIDI input, MIDI recording; the first device consumes the notes).
 * **Snippets and takes** (`project::Snippet`, `Take`): a snippet has its own tempo, meter and length in bars, plus takes with one active. A loop recording is a single WAV file, and each take is a window onto one pass of it.
 * **Clip content** (`project::ClipContent`): `Audio { source }`, `Midi { notes }` or `Snippet { snippet }` (a linked placement, which loops the snippet's active take). Clips are windows (`start`, `offset`, `length`) onto their content, so editing never changes the content.
@@ -81,6 +84,7 @@ The UI uses [egui](https://github.com/emilk/egui) (via `eframe`, OpenGL; Wayland
 
 ## Limits / next steps
 
+* VST3: only the main stereo input and output buses are used (side-chain and extra outputs stay silent/unrouted), there is no tempo or transport info for tempo-synced effects yet, and a plugin's `restartComponent` requests for new buses or latency are ignored. A plugin that crashes takes Studio down with it (no sandboxing).
 * LV2: only X11 plugin GUIs are hosted (no GTK/Qt GUIs). MIDI-only plugins (MIDI in, MIDI out, no audio) are not hosted. Multi-output instruments are downmixed to the track's stereo (no per-output routing to separate tracks yet).
 * There is no automation or time-stretching yet. Export covers the whole timeline (no range selection). Recording has no latency compensation, so takes may sit a few milliseconds late against the grid. Comping (combining bars from different takes) is not implemented.
 * Import is WAV only.
@@ -94,4 +98,5 @@ cargo test                                    # unit + headless UI tests (egui_k
 jackd -n studiotest -d dummy &                # optional: end-to-end through JACK
 JACK_DEFAULT_SERVER=studiotest cargo test engine_ -- --ignored
 cargo test tone3000 -- --ignored --test-threads=1   # opens TONE3000's GUI (needs the plugin + a display)
+cargo test vst3 -- --ignored                  # VST3: TONE3000.vst3 in ~/.vst3; VST3_PATH=<dir> for vst3_gain
 ```

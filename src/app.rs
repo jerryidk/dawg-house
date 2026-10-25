@@ -2,7 +2,7 @@
 //! device chain panel, device browser, recording and project I/O.
 
 use crate::audio::{self, AudioData, Recorder};
-use crate::device::{DeviceCategory, DeviceRegistry, DeviceShared};
+use crate::device::{DeviceCategory, DeviceRegistry, DeviceShared, PluginLink};
 use crate::engine::{Command, Engine, MAX_DEVICES, MAX_TRACKS};
 use crate::pianoroll::RollState;
 use crate::project::{Clip, ClipContent, DeviceSlot, History, Id, Note, Project, SourceRef, Take, TrackKind};
@@ -332,7 +332,7 @@ impl StudioApp {
                             bypass: false,
                             shared: Some(shared),
                             state: None,
-                            lv2: created.lv2,
+                            link: created.link,
                         },
                     );
                 }
@@ -359,7 +359,7 @@ impl StudioApp {
                 self.engine.send(Command::InsertDevice { track, index, device: created.device });
                 if let Some(s) = self.project.track_mut(track).and_then(|t| t.devices.get_mut(index)) {
                     s.shared = Some(shared);
-                    s.lv2 = created.lv2;
+                    s.link = created.link;
                 }
             }
             Err(e) => self.notify(e),
@@ -373,29 +373,38 @@ impl StudioApp {
     pub fn open_plugin_gui(&mut self, track: Id, index: usize) {
         let Some(t) = self.project.track(track) else { return };
         let Some(slot) = t.devices.get(index) else { return };
-        let (Some(link), Some(shared)) = (slot.lv2.clone(), slot.shared.clone()) else { return };
-        if self.gui.is_open(&shared) {
-            self.notify(format!("{} GUI is already open", slot.name));
-            return;
-        }
+        let (Some(link), Some(shared)) = (slot.link.clone(), slot.shared.clone()) else { return };
         // XStoreName takes Latin-1, so keep the title ASCII-safe.
         let title = format!("{} - {}", slot.name, t.name);
-        let rate = self.rate() as f32;
-        self.gui.open(link, shared, title, rate);
+        match link {
+            PluginLink::Lv2(link) => {
+                if self.gui.is_open(&shared) {
+                    self.notify(format!("{} GUI is already open", slot.name));
+                    return;
+                }
+                let rate = self.rate() as f32;
+                self.gui.open(link, shared, title, rate);
+            }
+            PluginLink::Vst3(link) => {
+                if let Err(e) = link.open_editor(title) {
+                    self.notify(format!("Plugin GUI failed: {e}"));
+                }
+            }
+        }
     }
 
     /// Close the GUIs of a track's devices (all of them, or only `index`).
     /// Must happen before the plugin instances can be freed.
     fn close_plugin_guis(&mut self, track: Id, index: Option<usize>) {
         let Some(t) = self.project.track(track) else { return };
-        let doomed: Vec<Arc<DeviceShared>> = t
-            .devices
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| index.is_none_or(|x| x == *i))
-            .filter_map(|(_, d)| d.shared.clone())
-            .collect();
-        for s in doomed {
+        let doomed: Vec<&DeviceSlot> = t.devices.iter().enumerate().filter(|(i, _)| index.is_none_or(|x| x == *i)).map(|(_, d)| d).collect();
+        let lv2: Vec<Arc<DeviceShared>> = doomed.iter().filter_map(|d| d.shared.clone()).collect();
+        for d in doomed {
+            if let Some(PluginLink::Vst3(link)) = &d.link {
+                link.close_editor();
+            }
+        }
+        for s in lv2 {
             self.gui.close(&s);
         }
     }
@@ -423,8 +432,8 @@ impl StudioApp {
                 let (Some(shared), Some(info)) = (&slot.shared, self.registry.get(&slot.device_id)) else { continue };
                 slot.params = info.params.iter().zip(&shared.params).map(|(p, v)| (p.symbol.clone(), v.get())).collect();
                 slot.bypass = shared.bypass.load(Ordering::Relaxed);
-                if let Some(link) = &slot.lv2 {
-                    slot.state = crate::lv2::save_state(link);
+                if let Some(link) = &slot.link {
+                    slot.state = link.save_state();
                 }
             }
         }
@@ -847,6 +856,11 @@ impl StudioApp {
             self.engine.send(Command::Stop);
         }
         self.gui.close_all();
+        for slot in self.project.tracks.iter().flat_map(|t| &t.devices) {
+            if let Some(PluginLink::Vst3(link)) = &slot.link {
+                link.close_editor();
+            }
+        }
         for t in &self.project.tracks {
             self.engine.send(Command::RemoveTrack(t.id));
         }
@@ -1414,7 +1428,7 @@ impl StudioApp {
                     }
                     shared.bypass.store(live.bypass.load(Ordering::Relaxed), Ordering::Relaxed);
                 }
-                let state = slot.lv2.as_ref().and_then(|l| crate::lv2::save_state(l)).or_else(|| slot.state.clone());
+                let state = slot.link.as_ref().and_then(|l| l.save_state()).or_else(|| slot.state.clone());
                 let created = self.registry.create(&slot.device_id, rate as f64, shared, state.as_deref()).map_err(|e| format!("{}: {e}", slot.name))?;
                 devices.push(created.device);
             }
@@ -1556,6 +1570,14 @@ impl StudioApp {
             let (found, usable) = lv2.fold((0, 0), |(f, u), d| (f + 1, u + d.unsupported.is_none() as usize));
             ui.label(RichText::new(format!("{usable} LV2 plugins usable ({found} found)")).color(TEXT_DIM))
                 .on_hover_text(self.registry.lv2_error().unwrap_or("Plugins found via LV2_PATH").to_string());
+            let vst3 = self.registry.devices.iter().filter(|d| d.id.starts_with("vst3:")).count();
+            let failures = self.registry.vst3_failures();
+            let hover = if failures.is_empty() {
+                format!("Searched: {}", crate::vst3::search_paths().iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "))
+            } else {
+                failures.iter().map(|(p, e)| format!("{}: {e}", p.display())).collect::<Vec<_>>().join("\n")
+            };
+            ui.label(RichText::new(format!("{vst3} VST3")).color(TEXT_DIM)).on_hover_text(hover);
             if let Some((msg, at)) = &self.status
                 && at.elapsed() < Duration::from_secs(8)
             {
@@ -1691,7 +1713,13 @@ impl StudioApp {
                         if !filter.is_empty() && !d.name.to_lowercase().contains(&filter) && !d.class.to_lowercase().contains(&filter) {
                             continue;
                         }
-                        let kind = if d.id.starts_with("lv2:") { "LV2" } else { "Built-in" };
+                        let kind = if d.id.starts_with("lv2:") {
+                            "LV2"
+                        } else if d.id.starts_with("vst3:") {
+                            "VST3"
+                        } else {
+                            "Built-in"
+                        };
                         let text = RichText::new(format!("{}   ", d.name)).color(if d.unsupported.is_some() { TEXT_DIM } else { theme::TEXT });
                         ui.horizontal(|ui| {
                             let r = ui.add_enabled(d.unsupported.is_none(), egui::Button::new(text).frame(false));

@@ -56,7 +56,8 @@ PipeWire / JACK server ──► ALSA (kernel drivers) ──► audio interface
 | `eframe` / `egui` | 0.35 | UI framework (OpenGL via glow) | Linux, macOS, Windows, web. 0.35 needs Rust ≥ 1.92 (0.37 needs 1.95) |
 | `egui-phosphor` | 0.13 | Icon font | Pure Rust |
 | `jack` | 0.13 | JACK client, loads libjack at runtime | JACK exists on macOS and Windows too, but is uncommon there |
-| `libloading` | 0.9 | `dlopen` for lilv, libX11, LAME, plugin GUIs | Cross-platform (`LoadLibrary` on Windows) |
+| `libloading` | 0.9 | `dlopen` for lilv, libX11, LAME, plugin GUIs, VST3 modules | Cross-platform (`LoadLibrary` on Windows) |
+| `vst3` | 0.3 | VST3 interfaces, generated from the SDK headers (MIT since 2025); Studio implements the host side | Pure Rust bindings, no SDK needed at build time |
 | `rtrb` | 0.4 | Lock-free ring buffers (UI ↔ audio thread) | Pure Rust |
 | `arc-swap` | 1.9 | Lock-free arrangement snapshot for the audio thread | Pure Rust |
 | `hound` | 3.5 | WAV read and write | Pure Rust |
@@ -75,6 +76,8 @@ Build: Rust 1.92 or newer (developed with 1.94).
 | `cargo test engine_ -- --ignored` | A running JACK server, e.g. `jackd -n studiotest -d dummy &` with `JACK_DEFAULT_SERVER=studiotest` |
 | `cargo test tone3000 -- --ignored --test-threads=1` | TONE3000 in `~/.lv2` and an X display |
 | `cargo test x42_tuner -- --ignored` | x42-plugins (`tuna.lv2`), an X display, and EGL |
+| `cargo test vst3_tone3000 -- --ignored` (+ `vst3_from_app`) | TONE3000 in `~/.vst3`; the editor tests need an X display |
+| `VST3_PATH=<dir> cargo test vst3_gain -- --ignored` | A VST3 bundle named *Gain* in `<dir>`, e.g. the `vst3` crate's `examples/gain.rs` built as a `cdylib` (also works for the Windows target under Wine) |
 
 ## Linux-specific code (portability hotspots)
 
@@ -82,7 +85,10 @@ Build: Rust 1.92 or newer (developed with 1.94).
 |---|---|---|
 | `main.rs` `use_pipewire_jack` | Re-exec with `LD_LIBRARY_PATH` (Unix `exec`) | Linux only (`cfg`) |
 | `backend/jack_backend.rs` | JACK client; reads `/proc/self/maps` to detect PipeWire | Linux only |
-| `backend/cpal_backend.rs` | WASAPI/ASIO and WinMM MIDI | Windows only |
+| `backend/wasapi_backend.rs` | WASAPI through the `windows` crate | Windows only |
+| `backend/cpal_backend.rs` | ASIO through cpal (`--features asio`) | Windows only |
+| `backend/winmidi.rs` | WinMM MIDI input through midir | Windows only |
+| `vst3/editor.rs` | Editor windows: X11 + `IRunLoop` (Linux), Win32 (Windows) | macOS would need an NSView host |
 | `lv2.rs` | `liblilv-0.so.0`, default LV2 directories | Library name and paths differ per OS |
 | `lv2ui.rs` | `libX11.so.6`, `XInitThreads`, `ui:X11UI` only | macOS: `ui:CocoaUI`; Windows: `ui:WindowsUI`. GTK and Qt GUIs are not supported |
 | `export.rs` | `libmp3lame.so.0` | `libmp3lame.dylib` / `libmp3lame.dll` elsewhere |
@@ -94,11 +100,11 @@ Build: Rust 1.92 or newer (developed with 1.94).
 * **Flatpak:** use the freedesktop runtime with the PipeWire socket, and ship lilv and LAME.
 * **AppImage:** bundle lilv, serd, sord, sratom, zix and LAME. Keep libjack, libGL/EGL and libX11 from the host system: they must match the host's sound server and GPU driver.
 
-**Windows:** ported on the `windows-port` branch; see [WINDOWS.md](WINDOWS.md). The engine runs on a `Backend` trait (`src/backend/`):
+**Windows:** see [WINDOWS.md](WINDOWS.md). The engine runs on a `Backend` trait (`src/backend/`):
 * JACK on Linux;
-* cpal on Windows: WASAPI by default, ASIO with `--features asio`;
+* on Windows: WASAPI driven directly (shared, low-latency shared and exclusive mode; every capture device), or ASIO through cpal with `--features asio`;
 * MIDI through midir.
 
-Windows-only crates: `cpal` (with the `realtime` feature for MMCSS) and `midir`; `jack` is Linux-only. Library names are per-OS: `lilv-0.dll`, `libmp3lame.dll`.
+Windows-only crates: `windows` (WASAPI, COM, Win32 editor windows), `midir`, and `cpal` (only with the `asio` feature); `jack` is Linux-only. Library names are per-OS: `lilv-0.dll`, `libmp3lame.dll`.
 
 **macOS:** add a CoreAudio backend through cpal (the `Backend` trait and `devio` layer are ready for it), set the `.dylib` names, and use CLAP/VST3/AU plugin hosting with Cocoa plugin GUIs.

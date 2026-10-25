@@ -23,22 +23,22 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 type P = *mut c_void;
-type Display = c_void;
-type Window = c_ulong;
-type Atom = c_ulong;
+pub(crate) type Display = c_void;
+pub(crate) type Window = c_ulong;
+pub(crate) type Atom = c_ulong;
 
 /// XEvent is a union padded to 24 longs.
 #[repr(C)]
-struct XEvent {
-    data: [c_long; 24],
+pub(crate) struct XEvent {
+    pub data: [c_long; 24],
 }
 
-const STRUCTURE_NOTIFY_MASK: c_long = 1 << 17;
-const DESTROY_NOTIFY: c_int = 17;
-const CLIENT_MESSAGE: c_int = 33;
+pub(crate) const STRUCTURE_NOTIFY_MASK: c_long = 1 << 17;
+pub(crate) const DESTROY_NOTIFY: c_int = 17;
+pub(crate) const CLIENT_MESSAGE: c_int = 33;
 
 #[repr(C)]
-struct XErrorEvent {
+pub(crate) struct XErrorEvent {
     kind: c_int,
     display: *mut Display,
     resource_id: c_ulong,
@@ -48,13 +48,14 @@ struct XErrorEvent {
     minor_code: u8,
 }
 
-type ErrorHandler = unsafe extern "C" fn(*mut Display, *mut XErrorEvent) -> c_int;
+pub(crate) type ErrorHandler = unsafe extern "C" fn(*mut Display, *mut XErrorEvent) -> c_int;
 
 macro_rules! x11_api {
     ($($field:ident = $sym:literal : fn($($arg:ty),*) -> $ret:ty;)*) => {
-        struct X11 {
+        /// libX11 entry points (also used for VST3 editor windows).
+        pub(crate) struct X11 {
             _lib: Library,
-            $($field: unsafe extern "C" fn($($arg),*) -> $ret,)*
+            $(pub $field: unsafe extern "C" fn($($arg),*) -> $ret,)*
         }
         impl X11 {
             fn load() -> Result<Self, String> {
@@ -93,7 +94,7 @@ x11_api! {
 
 static X11_API: OnceLock<Result<X11, String>> = OnceLock::new();
 
-fn x11() -> Result<&'static X11, String> {
+pub(crate) fn x11() -> Result<&'static X11, String> {
     X11_API.get_or_init(X11::load).as_ref().map_err(|e| e.clone())
 }
 

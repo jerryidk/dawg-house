@@ -110,6 +110,8 @@ pub struct WasapiBackend {
     /// Capture devices; a channel id's device part indexes this list, so it
     /// only grows while Studio runs.
     inputs: Vec<Endpoint>,
+    /// The Windows default capture device (listed first, so new tracks use it).
+    default_input: Option<String>,
     output: Option<(Stream, Opened)>,
     captures: Vec<(usize, Stream)>,
     /// Input device each track side listens to: (track, side) → index into `inputs`.
@@ -132,6 +134,7 @@ impl WasapiBackend {
             rate: 48000,
             outputs,
             inputs,
+            default_input: on_com_thread(|| default_endpoint(eCapture)).ok().flatten(),
             output: None,
             captures: vec![],
             routes: HashMap::new(),
@@ -223,6 +226,7 @@ impl WasapiBackend {
         if let Ok(outs) = on_com_thread(|| enumerate(eRender)) {
             self.outputs = outs;
         }
+        self.default_input = on_com_thread(|| default_endpoint(eCapture)).ok().flatten();
         if let Ok(ins) = on_com_thread(|| enumerate(eCapture)) {
             for ep in ins {
                 match self.inputs.iter_mut().find(|e| e.id == ep.id) {
@@ -326,11 +330,11 @@ impl Backend for WasapiBackend {
 
     fn sources(&self, kind: TrackKind) -> Vec<String> {
         match kind {
-            TrackKind::Audio => self
-                .inputs
-                .iter()
-                .flat_map(|e| (1..=e.channels.min(MAX_DEVICE_CHANNELS)).map(move |c| format!("{}{IN_SEP}{c}", e.name)))
-                .collect(),
+            TrackKind::Audio => {
+                let default = self.inputs.iter().filter(|e| Some(&e.id) == self.default_input.as_ref());
+                let others = self.inputs.iter().filter(|e| Some(&e.id) != self.default_input.as_ref());
+                default.chain(others).flat_map(|e| (1..=e.channels.min(MAX_DEVICE_CHANNELS)).map(move |c| format!("{}{IN_SEP}{c}", e.name))).collect()
+            }
             TrackKind::Instrument => self.midi.names.clone(),
         }
     }

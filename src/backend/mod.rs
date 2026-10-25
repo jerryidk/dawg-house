@@ -7,12 +7,18 @@
 //! buffer size).
 //!
 //! * Linux: JACK — jackd or PipeWire's JACK emulation (`jack_backend`).
-//! * Windows: cpal — WASAPI, or ASIO with the `asio` cargo feature
-//!   (`cpal_backend`), built on the platform-neutral [`devio`] layer.
+//! * Windows: WASAPI driven directly (`wasapi_backend`: low-latency shared
+//!   and exclusive mode, every capture device), or ASIO through cpal with the
+//!   `asio` cargo feature (`cpal_backend`). Both are built on the
+//!   platform-neutral [`devio`] layer.
 //! * Anywhere: [`NullBackend`] when no audio driver is available.
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "asio"))]
 mod cpal_backend;
+#[cfg(windows)]
+mod wasapi_backend;
+#[cfg(windows)]
+mod winmidi;
 // Used by the Windows backend; compiled (and unit-tested) everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub mod devio;
@@ -67,6 +73,26 @@ pub trait Backend {
     fn buffer_sizes(&self) -> Vec<u32> {
         (5..=12).map(|p| 1u32 << p).collect()
     }
+    /// Driver modes worth offering (e.g. WASAPI shared/exclusive); empty
+    /// when there is no choice.
+    fn modes(&self) -> Vec<String> {
+        vec![]
+    }
+    fn mode(&self) -> Option<String> {
+        None
+    }
+    /// Switch mode. May change the sample rate (see [`Backend::sample_rate`]).
+    fn set_mode(&mut self, _mode: &str) -> Result<(), String> {
+        Err("this driver has no modes".into())
+    }
+    /// Sample rates Studio can run the driver at; empty when the rate is
+    /// fixed by someone else (the JACK server).
+    fn sample_rates(&self) -> Vec<u32> {
+        vec![]
+    }
+    fn set_sample_rate(&mut self, _rate: u32) -> Result<(), String> {
+        Err("the sample rate is set by the audio server".into())
+    }
     /// Endpoints for a new track (called before it is handed to the audio thread).
     fn track_ports(&mut self, id: u64, kind: TrackKind) -> Result<TrackPorts, String>;
     /// Release endpoints of a removed track (UI thread).
@@ -92,7 +118,12 @@ pub fn open(name: &str, processor: Processor, shared: Arc<EngineShared>) -> Resu
     #[cfg(windows)]
     {
         let _ = name;
-        cpal_backend::CpalBackend::open(processor, shared).map(|b| Box::new(b) as Box<dyn Backend>)
+        #[cfg(feature = "asio")]
+        let processor = match cpal_backend::CpalBackend::open_asio(processor, shared.clone()) {
+            Ok(b) => return Ok(Box::new(b)),
+            Err(p) => p,
+        };
+        wasapi_backend::WasapiBackend::open(processor, shared).map(|b| Box::new(b) as Box<dyn Backend>)
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {

@@ -2,12 +2,13 @@
 //! (WASAPI / ASIO through cpal on Windows). Platform independent, so it is
 //! unit-tested on every OS.
 //!
-//! Model: the device has N input and M output channels. A track picks its
-//! input channels (`TrackShared::in_channels`) and MIDI source
+//! Model: one output device with M channels and any number of input devices
+//! with N channels each. A track picks its input channels
+//! (`TrackShared::in_channels`, see [`channel_id`]) and MIDI source
 //! (`TrackShared::midi_source`); the master goes to the first two output
 //! channels. Input and output arrive in separate driver callbacks, so captured
-//! input reaches the output callback, which runs the processor, through a
-//! ring buffer.
+//! input reaches the output callback, which runs the processor, through one
+//! ring buffer per input device.
 
 use super::{CycleIo, TrackPorts};
 use crate::engine::{EngineShared, Processor, TrackShared};
@@ -20,6 +21,32 @@ use std::time::Instant;
 /// input → output latency cannot grow when the two device clocks drift.
 const MAX_QUEUED_BLOCKS: usize = 4;
 const MAX_MIDI_PER_CYCLE: usize = 1024;
+/// Channels per input device in a channel id.
+pub const MAX_DEVICE_CHANNELS: usize = 64;
+
+/// Channel id stored in `TrackShared::in_channels`: input device `device`
+/// (an index into the backend's input device list), channel `channel`.
+pub fn channel_id(device: usize, channel: usize) -> i32 {
+    (device * MAX_DEVICE_CHANNELS + channel.min(MAX_DEVICE_CHANNELS - 1)) as i32
+}
+
+/// A capture stream feeding the runner: interleaved samples of `channels`
+/// channels from input device `device`.
+pub struct DeviceInput {
+    pub device: usize,
+    pub channels: usize,
+    pub rx: rtrb::Consumer<f32>,
+}
+
+/// An input device's ring and this cycle's deinterleaved channels.
+pub struct InputState {
+    device: usize,
+    channels: usize,
+    rx: rtrb::Consumer<f32>,
+    bufs: Vec<Vec<f32>>,
+    /// Input has arrived at least once (underruns before that are start-up).
+    started: bool,
+}
 
 /// A short MIDI message from MIDI input port `source`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,8 +79,8 @@ pub fn deinterleave(a: &[f32], b: &[f32], ch: usize, bufs: &mut [Vec<f32>]) {
 /// One cycle of device buffers.
 pub struct DeviceIo<'a> {
     pub frames: usize,
-    /// Captured input, one buffer per device channel.
-    pub inputs: &'a [Vec<f32>],
+    /// Captured input of every open input device.
+    pub inputs: &'a [InputState],
     pub midi: &'a [MidiInEvent],
     pub out_l: &'a mut [f32],
     pub out_r: &'a mut [f32],
@@ -68,10 +95,14 @@ impl CycleIo for DeviceIo<'_> {
         if !matches!(ports, TrackPorts::Device) {
             return None;
         }
-        let ch = |side: usize| shared.in_channels[side].load(Ordering::Relaxed);
-        let l = usize::try_from(ch(0)).ok().filter(|&c| c < self.inputs.len())?;
-        let r = usize::try_from(ch(1)).ok().filter(|&c| c < self.inputs.len()).unwrap_or(l);
-        Some((&self.inputs[l][..self.frames], &self.inputs[r][..self.frames]))
+        let channel = |side: usize| {
+            let id = usize::try_from(shared.in_channels[side].load(Ordering::Relaxed)).ok()?;
+            let (dev, ch) = (id / MAX_DEVICE_CHANNELS, id % MAX_DEVICE_CHANNELS);
+            let input = self.inputs.iter().find(|i| i.device == dev)?;
+            input.bufs.get(ch).map(|b| &b[..self.frames])
+        };
+        let l = channel(0)?;
+        Some((l, channel(1).unwrap_or(l)))
     }
 
     fn track_midi(&self, ports: &TrackPorts, shared: &TrackShared, f: &mut dyn FnMut(u32, &[u8])) {
@@ -89,19 +120,49 @@ impl CycleIo for DeviceIo<'_> {
     }
 }
 
+impl InputState {
+    /// Fill the channel buffers with `n` frames; true on an underrun.
+    fn pull(&mut self, n: usize) -> bool {
+        let ch = self.channels;
+        let rx = &mut self.rx;
+        let want = n * ch;
+        // Keep latency bounded: drop the oldest input beyond a few blocks.
+        let surplus = rx.slots().saturating_sub(want * MAX_QUEUED_BLOCKS) / ch * ch;
+        if surplus > 0
+            && let Ok(chunk) = rx.read_chunk(surplus)
+        {
+            chunk.commit_all();
+        }
+        let avail = rx.slots().min(want) / ch * ch;
+        if let Ok(chunk) = rx.read_chunk(avail) {
+            let (a, b) = chunk.as_slices();
+            deinterleave(a, b, ch, &mut self.bufs);
+            chunk.commit_all();
+        }
+        let got = avail / ch;
+        self.started |= got > 0;
+        if got < n {
+            for buf in &mut self.bufs {
+                buf[got..n].fill(0.0);
+            }
+            return self.started;
+        }
+        false
+    }
+}
+
 /// Runs the processor from a device's output callback.
 pub struct DeviceRunner {
     processor: Processor,
     shared: Arc<EngineShared>,
-    /// Interleaved captured input and its channel count.
-    input: Option<(rtrb::Consumer<f32>, usize)>,
+    inputs: Vec<InputState>,
     midi: rtrb::Consumer<MidiInEvent>,
-    in_bufs: Vec<Vec<f32>>,
     midi_buf: Vec<MidiInEvent>,
     out: [Vec<f32>; 2],
     rate: u32,
-    /// Input has arrived at least once (underruns before that are start-up).
-    input_started: bool,
+    /// Period reported in `EngineShared::buffer_size` (0 = frames per render
+    /// call, which varies under WASAPI shared mode).
+    period: u32,
 }
 
 impl DeviceRunner {
@@ -110,23 +171,39 @@ impl DeviceRunner {
         DeviceRunner {
             processor,
             shared,
-            input: None,
+            inputs: vec![],
             midi,
-            in_bufs: vec![],
             midi_buf: Vec::with_capacity(MAX_MIDI_PER_CYCLE),
             out: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
             rate,
-            input_started: false,
+            period: 0,
         }
     }
 
-    /// Attach a capture stream (`None` = no input). Allocates; call while the
-    /// output stream is stopped.
-    pub fn set_input(&mut self, input: Option<(rtrb::Consumer<f32>, usize)>) {
-        let channels = input.as_ref().map_or(0, |(_, c)| *c);
-        self.in_bufs = vec![vec![0.0; MAX_BLOCK]; channels];
-        self.input = input;
-        self.input_started = false;
+    /// Replace the capture streams. Allocates: call it holding the runner's
+    /// lock (the output callback then renders silence for a moment).
+    pub fn set_inputs(&mut self, inputs: Vec<DeviceInput>) {
+        self.inputs = inputs
+            .into_iter()
+            .map(|i| InputState { device: i.device, channels: i.channels.max(1), rx: i.rx, bufs: vec![vec![0.0; MAX_BLOCK]; i.channels.max(1)], started: false })
+            .collect();
+    }
+
+    /// Input devices currently attached.
+    #[cfg(test)]
+    pub fn input_devices(&self) -> Vec<usize> {
+        self.inputs.iter().map(|i| i.device).collect()
+    }
+
+    /// Fix the period shown in the UI (0 = frames per render call).
+    pub fn set_period(&mut self, frames: u32) {
+        self.period = frames;
+    }
+
+    /// Take the processor back (when the driver could not be started).
+    #[cfg_attr(not(all(windows, feature = "asio")), allow(dead_code))]
+    pub fn into_processor(self) -> Processor {
+        self.processor
     }
 
     pub fn shared(&self) -> &EngineShared {
@@ -151,7 +228,7 @@ impl DeviceRunner {
             self.pull_midi();
             {
                 let [ol, or] = &mut self.out;
-                let mut io = DeviceIo { frames: n, inputs: &self.in_bufs, midi: &self.midi_buf, out_l: &mut ol[..n], out_r: &mut or[..n] };
+                let mut io = DeviceIo { frames: n, inputs: &self.inputs, midi: &self.midi_buf, out_l: &mut ol[..n], out_r: &mut or[..n] };
                 self.processor.process(&mut io);
             }
             for i in 0..n {
@@ -164,38 +241,18 @@ impl DeviceRunner {
             }
             done += n;
         }
-        self.shared.buffer_size.store(frames as u32, Ordering::Relaxed);
+        let period = if self.period > 0 { self.period } else { frames as u32 };
+        self.shared.buffer_size.store(period, Ordering::Relaxed);
         let period = frames as f32 / self.rate.max(1) as f32;
         if period > 0.0 {
             self.shared.dsp_load.set(started.elapsed().as_secs_f32() / period);
         }
     }
 
-    /// Deinterleave `n` frames of captured input into the channel buffers.
+    /// Deinterleave `n` frames of each input device's capture.
     fn pull_input(&mut self, n: usize) {
-        let Some((rx, ch)) = &mut self.input else { return };
-        let ch = (*ch).max(1);
-        let want = n * ch;
-        // Keep latency bounded: drop the oldest input beyond a few blocks.
-        let surplus = rx.slots().saturating_sub(want * MAX_QUEUED_BLOCKS) / ch * ch;
-        if surplus > 0
-            && let Ok(chunk) = rx.read_chunk(surplus)
-        {
-            chunk.commit_all();
-        }
-        let avail = rx.slots().min(want) / ch * ch;
-        if let Ok(chunk) = rx.read_chunk(avail) {
-            let (a, b) = chunk.as_slices();
-            deinterleave(a, b, ch, &mut self.in_bufs);
-            chunk.commit_all();
-        }
-        let got = avail / ch;
-        self.input_started |= got > 0;
-        if got < n {
-            for buf in &mut self.in_bufs {
-                buf[got..n].fill(0.0);
-            }
-            if self.input_started {
+        for input in &mut self.inputs {
+            if input.pull(n) {
                 self.shared.xruns.fetch_add(1, Ordering::Relaxed);
             }
         }

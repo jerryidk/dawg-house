@@ -262,6 +262,9 @@ pub struct Project {
     /// Playback device (JACK client name) the master output goes to.
     #[serde(default)]
     pub master_output: Option<String>,
+    /// Sample rate positions are counted in (0 = unknown, older projects).
+    #[serde(default)]
+    pub sample_rate: u32,
 }
 
 pub const TRACK_COLORS: [[u8; 3]; 8] = [
@@ -292,6 +295,7 @@ impl Default for Project {
             master_db: 0.0,
             audio_dir: home.join("Music").join("Studio").join(format!("session-{stamp}")).join("audio"),
             master_output: None,
+            sample_rate: 0,
         }
     }
 }
@@ -395,6 +399,32 @@ impl Project {
 
     pub fn samples_per_beat(&self, rate: u32) -> f64 {
         rate as f64 * 60.0 / self.bpm.max(1.0) as f64
+    }
+
+    /// Convert every position and length counted in samples to `rate` (from
+    /// `self.sample_rate`; nothing to do when it is unknown or equal). MIDI
+    /// notes are in beats and audio is resampled on load, so they keep.
+    pub fn convert_rate(&mut self, rate: u32) {
+        let from = self.sample_rate;
+        self.sample_rate = rate;
+        if from == 0 || from == rate || rate == 0 {
+            return;
+        }
+        let ratio = rate as f64 / from as f64;
+        let u = |v: &mut u64| *v = (*v as f64 * ratio).round() as u64;
+        for t in &mut self.tracks {
+            for c in &mut t.clips {
+                c.start = (c.start as f64 * ratio).round() as i64;
+                for v in [&mut c.offset, &mut c.length, &mut c.fade_in, &mut c.fade_out] {
+                    u(v);
+                }
+            }
+            for take in t.snippets.iter_mut().flat_map(|s| s.takes.iter_mut()) {
+                for v in [&mut take.offset, &mut take.fade_in, &mut take.fade_out] {
+                    u(v);
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

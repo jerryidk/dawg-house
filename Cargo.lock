@@ -3321,6 +3321,7 @@ dependencies = [
  "rtrb",
  "serde",
  "serde_json",
+ "windows",
 ]
 
 [[package]]

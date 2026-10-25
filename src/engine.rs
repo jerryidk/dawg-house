@@ -747,6 +747,36 @@ impl Engine {
         self.backend.buffer_sizes()
     }
 
+    /// Driver modes (e.g. WASAPI shared/exclusive); empty if not selectable.
+    pub fn driver_modes(&self) -> Vec<String> {
+        if self.is_running() { self.backend.modes() } else { vec![] }
+    }
+
+    pub fn driver_mode(&self) -> Option<String> {
+        self.backend.mode()
+    }
+
+    /// Switch the driver mode. The driver's rate may change: compare
+    /// [`Engine::driver_rate`] with `sample_rate` afterwards.
+    pub fn set_driver_mode(&mut self, mode: &str) -> Result<(), String> {
+        self.backend.set_mode(mode)
+    }
+
+    /// Rates the driver can be switched to; empty when fixed (JACK).
+    pub fn sample_rates(&self) -> Vec<u32> {
+        if self.is_running() { self.backend.sample_rates() } else { vec![] }
+    }
+
+    pub fn set_driver_rate(&mut self, rate: u32) -> Result<(), String> {
+        self.backend.set_sample_rate(rate)
+    }
+
+    /// Rate the driver runs at right now. `sample_rate` is the session's
+    /// rate, which the app updates when it rebuilds the session.
+    pub fn driver_rate(&self) -> u32 {
+        self.backend.sample_rate()
+    }
+
     /// Output devices: (name, channels/ports).
     pub fn playback_devices(&self) -> Vec<(String, Vec<String>)> {
         if self.is_running() { self.backend.playback_devices() } else { vec![] }

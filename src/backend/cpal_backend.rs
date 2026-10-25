@@ -1,17 +1,15 @@
-//! Windows backend: WASAPI (always available) or ASIO (with the `asio` cargo
-//! feature and an installed ASIO driver) through cpal; MIDI input through
-//! midir (WinMM, which Windows 11 routes through Windows MIDI Services).
+//! ASIO backend (the `asio` cargo feature) through cpal; MIDI input through
+//! [`super::winmidi`]. Used when an ASIO driver is installed, unless
+//! `STUDIO_AUDIO=wasapi`; otherwise Studio uses [`super::wasapi_backend`].
 //!
 //! The audio work happens in [`DeviceRunner`] (platform neutral, unit-tested
-//! everywhere); this module only opens devices and streams. The output
-//! stream's callback runs the processor; the input stream's callback feeds
-//! it captured audio through a ring buffer.
-//!
-//! Host selection: ASIO when compiled in and a driver is present (lowest
-//! latency), unless `STUDIO_AUDIO=wasapi`; otherwise WASAPI shared mode.
+//! everywhere); this module only opens the driver and its streams. ASIO is
+//! full duplex: the input stream comes from the same driver and feeds the
+//! output callback, which runs the processor, through a ring buffer.
 
-use super::devio::{DeviceRunner, MidiInEvent};
-use super::{ALL_SOURCES, Backend, TrackPorts};
+use super::devio::{DeviceInput, DeviceRunner};
+use super::winmidi::MidiInputs;
+use super::{Backend, TrackPorts};
 use crate::engine::{EngineShared, Processor, TrackShared};
 use crate::lv2::MAX_BLOCK;
 use crate::project::TrackKind;
@@ -25,48 +23,34 @@ const CH_SEP: &str = " · Out ";
 
 pub struct CpalBackend {
     host: cpal::Host,
-    host_label: &'static str,
     output: cpal::Device,
-    input: Option<cpal::Device>,
     runner: Arc<Mutex<DeviceRunner>>,
     streams: Vec<cpal::Stream>,
     alive: Arc<AtomicBool>,
     rate: u32,
     buffer: cpal::BufferSize,
-    /// Buffer sizes the output device accepts (frames), if it says.
+    /// Buffer sizes the driver accepts (frames), if it says.
     buffer_range: Option<(u32, u32)>,
     in_channels: usize,
-    midi_names: Vec<String>,
-    _midi: Vec<midir::MidiInputConnection<()>>,
-}
-
-fn pick_host() -> (cpal::Host, &'static str) {
-    #[cfg(feature = "asio")]
-    {
-        let wasapi_forced = std::env::var("STUDIO_AUDIO").is_ok_and(|v| v.eq_ignore_ascii_case("wasapi"));
-        if !wasapi_forced
-            && let Ok(h) = cpal::host_from_id(cpal::HostId::Asio)
-            && h.output_devices().is_ok_and(|mut d| d.next().is_some())
-        {
-            return (h, "ASIO");
-        }
-    }
-    (cpal::default_host(), "WASAPI")
+    midi: MidiInputs,
 }
 
 impl CpalBackend {
-    pub fn open(processor: Processor, shared: Arc<EngineShared>) -> Result<Self, String> {
-        let (host, host_label) = pick_host();
-        let output = host.default_output_device().ok_or("no audio output device found")?;
-        let input = Self::input_for(&host, host_label, &output);
-        let rate = output.default_output_config().map_err(|e| format!("{output}: {e}"))?.sample_rate();
+    /// Open the first ASIO driver. Gives the processor back when there is
+    /// none (or `STUDIO_AUDIO=wasapi`), so another backend can use it.
+    pub fn open_asio(processor: Processor, shared: Arc<EngineShared>) -> Result<Self, Processor> {
+        let wasapi_forced = std::env::var("STUDIO_AUDIO").is_ok_and(|v| v.eq_ignore_ascii_case("wasapi"));
+        let found = (!wasapi_forced)
+            .then(|| cpal::host_from_id(cpal::HostId::Asio).ok())
+            .flatten()
+            .and_then(|h| h.default_output_device().map(|d| (h, d)));
+        let Some((host, output)) = found else { return Err(processor) };
+        let Ok(rate) = output.default_output_config().map(|c| c.sample_rate()) else { return Err(processor) };
         let (midi_tx, midi_rx) = rtrb::RingBuffer::new(4096);
         let runner = Arc::new(Mutex::new(DeviceRunner::new(processor, shared, rate, midi_rx)));
         let mut backend = CpalBackend {
             host,
-            host_label,
             output,
-            input,
             runner,
             streams: vec![],
             alive: Arc::new(AtomicBool::new(false)),
@@ -74,25 +58,21 @@ impl CpalBackend {
             buffer: cpal::BufferSize::Default,
             buffer_range: None,
             in_channels: 0,
-            midi_names: vec![],
-            _midi: vec![],
+            midi: MidiInputs::open(midi_tx),
         };
-        backend.start_streams()?;
-        backend.open_midi(midi_tx);
+        if let Err(e) = backend.start_streams() {
+            eprintln!("studio: ASIO: {e}; using WASAPI");
+            drop(backend.streams);
+            let runner = Arc::try_unwrap(backend.runner).ok().and_then(|m| m.into_inner().ok());
+            return match runner {
+                Some(r) => Err(r.into_processor()),
+                None => unreachable!("the runner is only shared with streams, which are gone"),
+            };
+        }
         Ok(backend)
     }
 
-    /// ASIO drivers are full duplex (input on the same device); WASAPI uses
-    /// the default capture device.
-    fn input_for(host: &cpal::Host, label: &str, output: &cpal::Device) -> Option<cpal::Device> {
-        if label == "ASIO" {
-            output.supports_input().then(|| output.clone())
-        } else {
-            host.default_input_device()
-        }
-    }
-
-    /// (Re)build and start the streams with the current device and buffer size.
+    /// (Re)build and start the streams with the current driver and buffer size.
     fn start_streams(&mut self) -> Result<(), String> {
         self.streams.clear(); // stops the old callbacks
         let out_cfg = self.output.default_output_config().map_err(|e| format!("{}: {e}", self.output))?;
@@ -105,21 +85,21 @@ impl CpalBackend {
         self.rate = config.sample_rate;
         let out_channels = config.channels as usize;
 
-        // Capture stream (same sample rate only; otherwise no input).
-        let mut input = None;
+        // ASIO drivers are full duplex: input comes from the same driver.
+        let mut inputs = vec![];
         let mut in_stream = None;
         self.in_channels = 0;
-        if let Some(dev) = &self.input
-            && let Ok(in_cfg) = dev.default_input_config()
+        if self.output.supports_input()
+            && let Ok(in_cfg) = self.output.default_input_config()
             && in_cfg.sample_rate() == self.rate
         {
             let channels = in_cfg.channels() as usize;
             let mut icfg = in_cfg.config();
             icfg.buffer_size = self.buffer;
             let (tx, rx) = rtrb::RingBuffer::new(MAX_BLOCK * channels * 8);
-            match build_input(dev, icfg, in_cfg.sample_format(), tx) {
+            match build_input(&self.output, icfg, in_cfg.sample_format(), tx) {
                 Ok(s) => {
-                    input = Some((rx, channels));
+                    inputs.push(DeviceInput { device: 0, channels, rx });
                     in_stream = Some(s);
                     self.in_channels = channels;
                 }
@@ -128,7 +108,7 @@ impl CpalBackend {
         }
         {
             let mut r = self.runner.lock().map_err(|_| "audio runner poisoned")?;
-            r.set_input(input);
+            r.set_inputs(inputs);
             r.set_rate(self.rate);
         }
         self.alive.store(true, Ordering::Relaxed);
@@ -140,40 +120,6 @@ impl CpalBackend {
         self.streams.push(out);
         self.streams.extend(in_stream);
         Ok(())
-    }
-
-    fn open_midi(&mut self, tx: rtrb::Producer<MidiInEvent>) {
-        let tx = Arc::new(Mutex::new(tx));
-        let Ok(probe) = midir::MidiInput::new("Studio") else { return };
-        let count = probe.ports().len();
-        for i in 0..count {
-            // `connect` consumes the MidiInput, so use one per port.
-            let Ok(input) = midir::MidiInput::new("Studio") else { continue };
-            let ports = input.ports();
-            let Some(port) = ports.get(i) else { continue };
-            let name = input.port_name(port).unwrap_or_else(|_| format!("MIDI {}", i + 1));
-            let tx = tx.clone();
-            let source = i as i32;
-            let conn = input.connect(
-                port,
-                "studio-in",
-                move |_, msg, _| {
-                    if let Some(e) = MidiInEvent::new(source, msg)
-                        && let Ok(mut t) = tx.lock()
-                    {
-                        let _ = t.push(e);
-                    }
-                },
-                (),
-            );
-            match conn {
-                Ok(c) => {
-                    self._midi.push(c);
-                    self.midi_names.push(name);
-                }
-                Err(e) => eprintln!("studio: MIDI input {name}: {e}"),
-            }
-        }
     }
 }
 
@@ -260,7 +206,7 @@ where
 
 impl Backend for CpalBackend {
     fn name(&self) -> String {
-        format!("{} · {}", self.host_label, self.output)
+        format!("ASIO · {}", self.output)
     }
 
     fn is_running(&self) -> bool {
@@ -291,8 +237,7 @@ impl Backend for CpalBackend {
         Ok(())
     }
 
-    /// Powers of two the device accepts, plus its own minimum and maximum
-    /// (e.g. WASAPI's 480-frame/10 ms default period is not a power of two).
+    /// Powers of two the driver accepts, plus its own minimum and maximum.
     fn buffer_sizes(&self) -> Vec<u32> {
         let all: Vec<u32> = (5..=12).map(|p| 1u32 << p).collect();
         match self.buffer_range {
@@ -316,24 +261,21 @@ impl Backend for CpalBackend {
     fn sources(&self, kind: TrackKind) -> Vec<String> {
         match kind {
             TrackKind::Audio => (1..=self.in_channels).map(|c| format!("In {c}")).collect(),
-            TrackKind::Instrument => self.midi_names.clone(),
+            TrackKind::Instrument => self.midi.names.clone(),
         }
     }
 
     fn connect_input(&mut self, _: u64, kind: TrackKind, shared: &TrackShared, side: usize, source: Option<&str>) {
         match kind {
             TrackKind::Audio => {
-                let ch = source.and_then(|s| s.strip_prefix("In ")).and_then(|n| n.parse::<i32>().ok()).map_or(-1, |n| n - 1);
+                let ch = source
+                    .and_then(|s| s.strip_prefix("In "))
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .filter(|&n| n >= 1)
+                    .map_or(-1, |n| super::devio::channel_id(0, n - 1));
                 shared.in_channels[side.min(1)].store(ch, Ordering::Relaxed);
             }
-            TrackKind::Instrument => {
-                let src = match source {
-                    Some(ALL_SOURCES) => -2,
-                    Some(name) => self.midi_names.iter().position(|n| n == name).map_or(-1, |i| i as i32),
-                    None => -1,
-                };
-                shared.midi_source.store(src, Ordering::Relaxed);
-            }
+            TrackKind::Instrument => shared.midi_source.store(self.midi.source_index(source), Ordering::Relaxed),
         }
     }
 
@@ -358,7 +300,6 @@ impl Backend for CpalBackend {
         let Some(name) = ports.first().and_then(|p| p.rsplit_once(CH_SEP)).map(|(n, _)| n.to_string()) else { return };
         let Some(dev) = self.host.output_devices().ok().and_then(|mut ds| ds.find(|d| d.to_string() == name)) else { return };
         let previous = std::mem::replace(&mut self.output, dev);
-        self.input = Self::input_for(&self.host, self.host_label, &self.output).or(self.input.take());
         if let Err(e) = self.start_streams() {
             eprintln!("studio: cannot use {name}: {e}");
             self.output = previous;

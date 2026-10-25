@@ -861,7 +861,7 @@ impl StudioApp {
 
     pub fn new_project(&mut self) {
         self.teardown();
-        self.project = Project::default();
+        self.project = Project { sample_rate: self.rate(), ..Project::default() };
         self.project_path = None;
         self.add_track(TrackKind::Audio);
         self.add_track(TrackKind::Instrument);
@@ -876,7 +876,21 @@ impl StudioApp {
                 return;
             }
         };
+        let missing = self.load_project(project);
+        self.project_path = Some(path.clone());
+        self.notify(if missing > 0 {
+            format!("Opened {} ({missing} audio files missing)", path.display())
+        } else {
+            format!("Opened {}", path.display())
+        });
+    }
+
+    /// Replace the session with `project`, converted to the engine's rate:
+    /// load its audio, create its tracks and devices. Returns how many audio
+    /// files are missing.
+    fn load_project(&mut self, mut project: Project) -> usize {
         self.teardown();
+        project.convert_rate(self.rate());
         self.project = project;
         let mut missing = 0;
         for s in self.project.sources.clone() {
@@ -901,13 +915,39 @@ impl StudioApp {
             self.engine.set_master_output(&ports);
         }
         self.refresh_ports();
-        self.project_path = Some(path.clone());
-        self.notify(if missing > 0 {
-            format!("Opened {} ({missing} audio files missing)", path.display())
-        } else {
-            format!("Opened {}", path.display())
-        });
         self.locate(0);
+        missing
+    }
+
+    /// Apply a driver setting (mode, rate). If the driver's sample rate
+    /// changed, rebuild the session at the new rate: positions are converted
+    /// and plugins re-created with their state.
+    pub fn change_driver(&mut self, change: impl FnOnce(&mut Engine) -> Result<(), String>) {
+        if self.recording() {
+            self.notify("Stop recording before changing audio settings");
+            return;
+        }
+        let before = self.engine.sample_rate;
+        self.sync_device_params();
+        self.project.sample_rate = before;
+        let snapshot = serde_json::to_string(&self.project);
+        if let Err(e) = change(&mut self.engine) {
+            self.notify(e);
+        }
+        let now = self.engine.driver_rate();
+        if now != before && now > 0 {
+            self.engine.sample_rate = now;
+            self.registry = DeviceRegistry::new(now as f32);
+            match snapshot.map_err(|e| e.to_string()).and_then(|s| serde_json::from_str::<Project>(&s).map_err(|e| e.to_string())) {
+                Ok(p) => {
+                    let missing = self.load_project(p);
+                    let warn = if missing > 0 { format!(" ({missing} audio files missing)") } else { String::new() };
+                    self.notify(format!("Now running at {} Hz{warn}", now));
+                }
+                Err(e) => self.notify(format!("Could not rebuild the session: {e}")),
+            }
+        }
+        self.refresh_ports();
     }
 
     pub fn save_project(&mut self, save_as: bool) {
@@ -928,6 +968,7 @@ impl StudioApp {
     /// Write the project to `path` (plugin parameters and state included).
     pub fn save_project_to(&mut self, path: PathBuf) {
         self.sync_device_params();
+        self.project.sample_rate = self.rate();
         // Only keep sources still referenced by clips or takes.
         let used = self.project.used_sources();
         self.project.sources.retain(|s| used.contains(&s.id));
@@ -1260,6 +1301,58 @@ impl StudioApp {
         }
     }
 
+    /// Driver mode and sample rate, where the driver lets Studio choose
+    /// (WASAPI); otherwise just the rate.
+    fn driver_pickers(&mut self, ui: &mut egui::Ui) {
+        let modes = self.engine.driver_modes();
+        let mut pick_mode = None;
+        if !modes.is_empty() {
+            let current = self.engine.driver_mode().unwrap_or_default();
+            egui::ComboBox::from_id_salt("driver_mode")
+                .selected_text(RichText::new(&current).color(TEXT_DIM))
+                .width(90.0)
+                .show_ui(ui, |ui| {
+                    theme::section_label(ui, "Driver mode");
+                    for m in &modes {
+                        if ui.selectable_label(*m == current, m).clicked() && *m != current {
+                            pick_mode = Some(m.clone());
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Shared: plays alongside other apps; low latency when Studio runs at the Windows mixer's rate.\n\
+                     Exclusive: Studio owns the output device (lowest latency, any supported rate); other apps go silent on it.",
+                );
+        }
+        let rate = self.rate();
+        let rates = self.engine.sample_rates();
+        let mut pick_rate = None;
+        if rates.is_empty() {
+            ui.label(RichText::new(format!("{:.1} kHz", rate as f32 / 1000.0)).color(TEXT_DIM));
+        } else {
+            egui::ComboBox::from_id_salt("sample_rate")
+                .selected_text(RichText::new(format!("{:.1} kHz", rate as f32 / 1000.0)).color(TEXT_DIM))
+                .width(80.0)
+                .show_ui(ui, |ui| {
+                    theme::section_label(ui, "Sample rate");
+                    for r in rates {
+                        if ui.selectable_label(r == rate, format!("{r} Hz")).clicked() && r != rate {
+                            pick_rate = Some(r);
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Changing the rate rebuilds the session: positions are converted and plugins are re-created with their state.");
+        }
+        if let Some(m) = pick_mode {
+            self.change_driver(|e| e.set_driver_mode(&m));
+        }
+        if let Some(r) = pick_rate {
+            self.change_driver(|e| e.set_driver_rate(r));
+        }
+    }
+
     /// Period size selector with the latency each choice gives.
     fn buffer_size_picker(&mut self, ui: &mut egui::Ui) {
         let rate = self.rate().max(1) as f32;
@@ -1449,9 +1542,8 @@ impl StudioApp {
             let e = &self.engine;
             if e.is_running() {
                 let backend = e.backend_name();
-                let rate = e.sample_rate;
                 ui.label(RichText::new(format!("{} {backend}", icon::PLUGS)).color(theme::SOLO));
-                ui.label(RichText::new(format!("{:.1} kHz", rate as f32 / 1000.0)).color(TEXT_DIM));
+                self.driver_pickers(ui);
                 self.buffer_size_picker(ui);
                 let e = &self.engine;
                 ui.label(RichText::new(format!("DSP {:.0}% · xruns {}", e.cpu_load(), e.shared.xruns.load(Ordering::Relaxed))).color(TEXT_DIM));

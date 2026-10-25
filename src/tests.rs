@@ -701,7 +701,7 @@ fn avl_drumkit_gui() {
 #[test]
 fn device_runner_routes_inputs_midi_and_outputs() {
     use crate::backend::TrackPorts;
-    use crate::backend::devio::{DeviceRunner, MidiInEvent};
+    use crate::backend::devio::{DeviceInput, DeviceRunner, MidiInEvent, channel_id};
     use crate::engine::{Arrangement, Command, EngineShared, EngineTrack, Processor, TrackShared};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -714,7 +714,7 @@ fn device_runner_routes_inputs_midi_and_outputs() {
     // Audio track monitoring device input channel 2 (mono).
     let audio = Arc::new(TrackShared::default());
     audio.monitor.store(true, Ordering::Relaxed);
-    audio.in_channels[0].store(1, Ordering::Relaxed);
+    audio.in_channels[0].store(channel_id(0, 1), Ordering::Relaxed);
     assert!(q.commands.push(Command::AddTrack(EngineTrack::new(1, TrackKind::Audio, audio.clone(), TrackPorts::Device))).is_ok());
     // Instrument track with the built-in synth, listening to every MIDI port.
     let inst = Arc::new(TrackShared::default());
@@ -728,7 +728,7 @@ fn device_runner_routes_inputs_midi_and_outputs() {
     let (mut in_tx, in_rx) = rtrb::RingBuffer::new(256 * 2 * 32);
     let (mut midi_tx, midi_rx) = rtrb::RingBuffer::new(64);
     let mut runner = DeviceRunner::new(processor, shared.clone(), 48000, midi_rx);
-    runner.set_input(Some((in_rx, 2)));
+    runner.set_inputs(vec![DeviceInput { device: 0, channels: 2, rx: in_rx }]);
 
     // 1. Channel 2 (0.5) reaches both master channels; ch 1 (0.1) is ignored;
     //    outputs 3 and 4 of a 4-channel device stay silent.
@@ -763,6 +763,37 @@ fn device_runner_routes_inputs_midi_and_outputs() {
     let mut out = vec![0.0f32; 256 * 2];
     runner.render(&mut out, 2);
     assert!(in_tx.slots() >= in_tx.buffer().capacity() - 256 * 2 * 4, "queued input should be capped at 4 blocks");
+
+    // 4. Two input devices: left from device 0 channel 2, right from device 3
+    //    (mono) channel 1; channels of devices that are not open read nothing.
+    let (mut a_tx, a_rx) = rtrb::RingBuffer::new(4096);
+    let (mut b_tx, b_rx) = rtrb::RingBuffer::new(4096);
+    runner.set_inputs(vec![DeviceInput { device: 0, channels: 2, rx: a_rx }, DeviceInput { device: 3, channels: 1, rx: b_rx }]);
+    assert_eq!(runner.input_devices(), [0, 3]);
+    audio.monitor.store(true, Ordering::Relaxed);
+    audio.stereo.store(true, Ordering::Relaxed);
+    audio.pan.set(0.0);
+    audio.in_channels[1].store(channel_id(3, 0), Ordering::Relaxed);
+    inst.monitor.store(false, Ordering::Relaxed);
+    for _ in 0..256 {
+        a_tx.push(0.1).unwrap();
+        a_tx.push(0.25).unwrap();
+        b_tx.push(-0.5).unwrap();
+    }
+    let mut out = vec![0.0f32; 256 * 2];
+    runner.set_period(512);
+    runner.render(&mut out, 2);
+    assert_eq!(shared.buffer_size.load(Ordering::Relaxed), 512, "a fixed period is reported as is");
+    let (l, r) = (out[out.len() - 2], out[out.len() - 1]);
+    assert!(l > 0.1 && r < -0.1, "left from device 0, right from device 3: {l} {r}");
+    audio.in_channels[1].store(channel_id(7, 0), Ordering::Relaxed);
+    audio.in_channels[0].store(channel_id(7, 0), Ordering::Relaxed);
+    for _ in 0..256 {
+        a_tx.push(0.0).unwrap();
+        a_tx.push(0.0).unwrap();
+        b_tx.push(0.0).unwrap();
+    }
+    runner.render(&mut out, 2);
 
     // SysEx is not a short message.
     assert!(MidiInEvent::new(0, &[0xF0, 1, 2, 3, 0xF7]).is_none());
@@ -816,4 +847,119 @@ fn windows_backend_plays_the_synth() {
     assert!(engine.shared.position.load(Ordering::Relaxed) > 0, "transport did not advance");
     assert!(peak > 0.01, "the synth should be audible on the master");
     assert!(!devices.is_empty());
+}
+
+/// Positions are counted in samples, so a project made at one rate and
+/// opened at another is converted: clips and takes keep their time, notes
+/// (in beats) are untouched.
+#[test]
+fn project_converts_between_sample_rates() {
+    use crate::project::{Clip, ClipContent, Note, Project, Take};
+    let mut p = Project { sample_rate: 48000, ..Project::default() };
+    let track = p.new_track(TrackKind::Audio).id;
+    let clip = p.alloc_id();
+    let c = Clip { id: clip, content: ClipContent::Audio { source: 1 }, name: "a".into(), start: 48000, offset: 4800, length: 96000, gain: 1.0, fade_in: 480, fade_out: 0, muted: false };
+    p.track_mut(track).unwrap().clips.push(c);
+    let snip = p.new_snippet(track).unwrap();
+    let mut take = Take::new(9, "t".into(), ClipContent::Midi { notes: vec![Note { pitch: 60, velocity: 100, start: 1.5, length: 0.5 }] }, 24000);
+    take.fade_out = 960;
+    p.snippet_mut(snip).unwrap().takes.push(take);
+
+    p.convert_rate(44100);
+    assert_eq!(p.sample_rate, 44100);
+    let c = p.clip_mut(clip).unwrap();
+    assert_eq!((c.start, c.length, c.offset, c.fade_in), (44100, 88200, 4410, 441));
+    let t = &p.snippet(snip).unwrap().takes[0];
+    assert_eq!((t.offset, t.fade_out), (22050, 882));
+    assert!(matches!(&t.content, ClipContent::Midi { notes } if notes[0].start == 1.5));
+
+    // Unknown rate (older projects): nothing to convert.
+    let mut old = Project::default();
+    old.convert_rate(96000);
+    assert_eq!(old.sample_rate, 96000);
+}
+
+/// WASAPI backend settings end to end (under Wine, WASAPI goes through
+/// winepulse to PipeWire/PulseAudio):
+///   WINEDEBUG=-all cargo test --target x86_64-pc-windows-gnu wasapi_ -- --ignored --nocapture
+/// Capture devices are listed and opened on demand, the smallest shared
+/// period runs, a rate change reopens the device and exclusive mode opens
+/// or reports why not.
+#[cfg(windows)]
+#[test]
+#[ignore]
+fn wasapi_modes_rates_and_inputs() {
+    use crate::engine::{Engine, TrackShared};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let advances = |engine: &mut Engine| {
+        let start = engine.shared.position.load(Ordering::Relaxed);
+        engine.send(crate::engine::Command::Play);
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(400) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        engine.send(crate::engine::Command::Stop);
+        std::thread::sleep(Duration::from_millis(50));
+        engine.shared.position.load(Ordering::Relaxed) > start
+    };
+    let mut engine = Engine::new("studio-wasapi-test");
+    assert!(engine.is_running(), "{:?}", engine.error);
+    println!("{} at {} Hz, period {}", engine.backend_name(), engine.driver_rate(), engine.buffer_size());
+    println!("modes {:?}, rates {:?}, periods {:?}", engine.driver_modes(), engine.sample_rates(), engine.buffer_sizes());
+    assert_eq!(engine.driver_modes(), ["Shared", "Exclusive"]);
+
+    // Inputs: every capture device's channels; routing one opens it.
+    let sources = engine.sources(TrackKind::Audio);
+    println!("inputs {sources:?}");
+    let track = Arc::new(TrackShared::default());
+    track.monitor.store(true, Ordering::Relaxed);
+    engine.add_track(1, TrackKind::Audio, track.clone()).unwrap();
+    if let Some(src) = sources.first() {
+        engine.connect_input(1, TrackKind::Audio, &track, 0, Some(src));
+        assert!(track.in_channels[0].load(Ordering::Relaxed) >= 0);
+        assert!(advances(&mut engine));
+        println!("input peak {:.4}, xruns {}", track.in_peak[0].take(), engine.shared.xruns.load(Ordering::Relaxed));
+    }
+
+    // The smallest offered period the device accepts (Wine offers some it
+    // then refuses); a refused one leaves the previous setting running.
+    for n in engine.buffer_sizes() {
+        match engine.set_buffer_size(n) {
+            Ok(()) => {
+                assert!(advances(&mut engine));
+                println!("{} · period {} (asked {n}), DSP {:.1}%", engine.backend_name(), engine.buffer_size(), engine.cpu_load());
+                break;
+            }
+            Err(e) => {
+                println!("refused: {e}");
+                assert!(advances(&mut engine), "the previous setting should still run");
+            }
+        }
+    }
+
+    // A different rate.
+    let other = if engine.driver_rate() == 44100 { 48000 } else { 44100 };
+    engine.set_driver_rate(other).unwrap();
+    assert_eq!(engine.driver_rate(), other);
+    assert!(advances(&mut engine), "transport should run at {other} Hz");
+    println!("{} at {} Hz, period {}", engine.backend_name(), engine.driver_rate(), engine.buffer_size());
+
+    // Exclusive mode: Wine may not offer it; either way the engine keeps running.
+    match engine.set_driver_mode("Exclusive") {
+        Ok(()) => {
+            assert!(advances(&mut engine));
+            println!("exclusive: {} at {} Hz, period {}, periods {:?}", engine.backend_name(), engine.driver_rate(), engine.buffer_size(), engine.buffer_sizes());
+        }
+        Err(e) => println!("exclusive mode unavailable: {e}"),
+    }
+    engine.set_driver_mode("Shared").unwrap();
+    assert!(advances(&mut engine));
+
+    // Don't leave test settings behind for the app.
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let _ = std::fs::remove_file(std::path::Path::new(&appdata).join("Studio").join("audio.json"));
+    }
 }
